@@ -243,19 +243,20 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     }
   }
 
-  const welcomeVideo = 'CgACAgQAAxkBAAEDB0Ro_-WjtBmGV0HMXxDJaJ0zT2BeygACuR4AAgrS-FN2hA87R-M-DjYE'; // your file_id
-  const welcomeText = `Hey there, ${msg.from.first_name || ''}\n` +
-    `Welcome to the Justice on Solana community — where we’re redefining what fairness means in the world of crypto and Web3.\n\n` +
-    `This isn’t just another blockchain project.\n` +
-    `It’s a movement — a mission to bring accountability, protection, and transparency to the decentralized world through smart contracts, on-chain arbitration, and community-driven governance.\n\n` +
-    `Here’s what you can expect as a member:\n\n` +
-    `• Stay updated on project milestones and token drops.\n` +
-    `• Participate in discussions on blockchain law and DeFi protection.\n` +
-    `• Connect with innovators, builders, and justice advocates.\n` +
-    `• Be part of the first decentralized legal ecosystem on Solana.\n\n` +
-    `Your voice matters here.\n` +
-    `Together, we’re building a fairer, safer, and more transparent Web3.\n\n` +
-    `Welcome to the future of justice — on-chain and unstoppable.\n⚖️\n#JusticeOnSolana #Solana #Web3 #CryptoLaw`;
+  // Your media file_id — can be a GIF or a video
+  const welcomeVideo = 'CgACAgQAAxkBAAID3GkAAQzUoke15DSdRceHB1GOyu8x9QACqB0AAoMcAVDmEWSRpUxdUjYE';
+
+  // Welcome text (HTML mode)
+  const welcomeText = `
+<b>Hey there, ${msg.from.first_name || ''}</b> 👋<br><br>
+Welcome to <b>Justice on Solana</b> — where fairness meets blockchain.<br><br>
+This isn’t just another project — it’s a <b>movement</b>.<br><br>
+• Stay updated on milestones and drops.<br>
+• Discuss blockchain law & DeFi protection.<br>
+• Connect with innovators and justice advocates.<br><br>
+Together, we’re building a <b>fairer, safer, and more transparent Web3</b>.<br><br>
+⚖️ <i>#JusticeOnSolana #Web3 #CryptoLaw</i>
+`;
 
   const keyboard = {
     keyboard: [["➡️ Continue"]],
@@ -263,19 +264,37 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     one_time_keyboard: true
   };
 
-  try {
-    await bot.sendVideo(chatId, welcomeVideo, {
-      caption: welcomeText,
-      parse_mode: 'Markdown',
-      reply_markup: keyboard
-    });
-  } catch (error) {
-    console.error('Error sending video:', error);
-    await bot.sendMessage(chatId, welcomeText, {
-      parse_mode: 'Markdown',
-      reply_markup: keyboard
-    });
+  // Helper to test if file_id is a valid video or animation
+  async function trySendVideoOrAnimation() {
+    try {
+      // Try sending as a video first
+      await bot.sendVideo(chatId, welcomeVideo, {
+        caption: welcomeText,
+        parse_mode: 'HTML',
+        reply_markup: keyboard
+      });
+      console.log('✅ Sent as video');
+    } catch (videoError) {
+      console.warn('❌ Video send failed, trying as animation...', videoError.description);
+      try {
+        // If video fails, send as animation (GIF)
+        await bot.sendAnimation(chatId, welcomeVideo, {
+          caption: welcomeText,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        });
+        console.log('✅ Sent as animation');
+      } catch (animError) {
+        console.error('❌ Both video and animation failed:', animError.description);
+        await bot.sendMessage(chatId, welcomeText, {
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        });
+      }
+    }
   }
+
+  await trySendVideoOrAnimation();
 });
 
 
@@ -1460,45 +1479,57 @@ bot.onText(/\/referralreward\s+(.+)/, async (msg, match) => {
 
 const recentReplies = new Map();
 
-bot.on('message', async (msg) => {
-  // Skip bot messages
+// Wrap all send methods, not just sendMessage
+for (const fn of ['sendMessage', 'sendPhoto', 'sendVideo', 'sendMediaGroup']) {
+  const original = bot[fn].bind(bot);
+  bot[fn] = async (...args) => {
+    const msg = await original(...args);
+    bot.emit('sent_reply', msg);
+    return msg;
+  };
+}
+
+bot.on("message", async (msg) => {
   if (!msg.from || msg.from.is_bot) return;
 
   const chatId = msg.chat.id;
   const userMsgId = msg.message_id;
 
-  // Track replies the bot sends for this message
-  bot.once('sent_reply', (botMsg) => {
+  bot.once("sent_reply", (botMsg) => {
     if (botMsg.chat.id === chatId) {
       if (!recentReplies.has(userMsgId)) recentReplies.set(userMsgId, []);
       recentReplies.get(userMsgId).push(botMsg.message_id);
     }
   });
 
-  // Wait 30 seconds, then delete both user + bot reply
   setTimeout(async () => {
     try {
-      // Delete user's message
-      await bot.deleteMessage(chatId, userMsgId);
+      await bot.deleteMessage(chatId, userMsgId); // delete user's command
     } catch (e) {}
 
-    // Delete any bot messages we recorded for this user message
     const botMsgs = recentReplies.get(userMsgId) || [];
     for (const botMsgId of botMsgs) {
       try {
-        await bot.deleteMessage(chatId, botMsgId);
+        await bot.deleteMessage(chatId, botMsgId); // delete bot replies (text, photo, etc.)
       } catch (e) {}
     }
+
     recentReplies.delete(userMsgId);
   }, 30000);
 });
 
-// Monkey-patch sendMessage to emit an event we can track
-const originalSendMessage = bot.sendMessage.bind(bot);
-bot.sendMessage = async (...args) => {
-  const msg = await originalSendMessage(...args);
-  bot.emit('sent_reply', msg);
-  return msg;
-};
+// ✅ Monkey-patch all common send methods so every bot reply is tracked
+function patchSend(method) {
+  const original = bot[method].bind(bot);
+  bot[method] = async (...args) => {
+    const msg = await original(...args);
+    bot.emit("sent_reply", msg);
+    return msg;
+  };
+}
 
-console.log('Bot is running...');
+["sendMessage", "sendPhoto", "sendDocument", "sendVideo", "sendAnimation", "sendAudio"].forEach(
+  patchSend
+);
+
+console.log("Bot is running...");
