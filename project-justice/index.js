@@ -838,33 +838,6 @@ async function handleStats(chatId) {
   const now = Date.now();
   const onlineUsers = allUsers.filter(u => (now - u.last_seen) < 300000).length;
   const offlineUsers = totalUsers - onlineUsers;
-  
-  //const systemHealth = await analyzeSystemHealth();
-  
-async function analyzeSystemHealth() {
-  const cpuLoad = await si.currentLoad();
-  const mem = await si.mem();
-  const netStats = await si.networkStats();
-
-  const cpu = cpuLoad.currentLoad.toFixed(1);
-  const ramUsed = (mem.active / 1024 / 1024 / 1024).toFixed(2);
-  const ramTotal = (mem.total / 1024 / 1024 / 1024).toFixed(2);
-  const netIn = (netStats[0].rx_sec / 1024).toFixed(1);
-  const netOut = (netStats[0].tx_sec / 1024).toFixed(1);
-  const uptime = (process.uptime() / 60).toFixed(1);
-
-  const heart = cpu < 50 ? "💚" : cpu < 80 ? "💛" : "❤️‍🔥";
-
-  return `
-⚙️ *System Health Report* ${heart}
-
-🧠 *CPU Load:* ${cpu}%
-💾 *Memory:* ${ramUsed}GB / ${ramTotal}GB
-🌐 *Network:* ${netIn}KB/s ⬇️ | ${netOut}KB/s ⬆️
-⏱️ *Uptime:* ${uptime} minutes
-🚦 *Status:* ${heart} ${cpu < 80 ? "Stable" : "High Load"}
-  `;
-}
 
   const totalBalance = await db.getTotalBalance();
   
@@ -1149,6 +1122,38 @@ bot.onText(/\/requestwithdraw\s+(.+)/, async (msg, match) => {
   const newBalance = parseFloat(user.balance) - amount;
   await db.updateUser(userId, { balance: newBalance });
 });
+
+// ✅ Global system health function
+async function analyzeSystemHealth() {
+  try {
+    const cpuLoad = await si.currentLoad();
+    const mem = await si.mem();
+    const netStats = await si.networkStats();
+
+    const cpu = cpuLoad.currentLoad.toFixed(1);
+    const ramUsed = (mem.active / 1024 / 1024 / 1024).toFixed(2);
+    const ramTotal = (mem.total / 1024 / 1024 / 1024).toFixed(2);
+    const netIn = (netStats[0].rx_sec / 1024).toFixed(1);
+    const netOut = (netStats[0].tx_sec / 1024).toFixed(1);
+    const uptime = (process.uptime() / 60).toFixed(1);
+
+    const heart = cpu < 50 ? "💚" : cpu < 80 ? "💛" : "❤️‍🔥";
+
+    return `
+⚙️ *System Health Report* ${heart}
+
+🧠 *CPU Load:* ${cpu}%
+💾 *Memory:* ${ramUsed}GB / ${ramTotal}GB
+🌐 *Network:* ${netIn}KB/s ⬇️ | ${netOut}KB/s ⬆️
+⏱️ *Uptime:* ${uptime} minutes
+🚦 *Status:* ${heart} ${cpu < 80 ? "Stable" : "High Load"}
+    `;
+  } catch (err) {
+    console.error("System health check failed:", err);
+    return "❌ Failed to analyze system health.";
+  }
+}
+
 
 bot.onText(/\/health/, async (msg) => {
   const chatId = msg.chat.id;
