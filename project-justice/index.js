@@ -1,7 +1,9 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const os = require("os");
 const si = require('systeminformation');
+const process = require("process");
 const fs = require('fs');
 const path = require('path');
 const db = require('./database');
@@ -838,10 +840,7 @@ async function handleStats(chatId) {
   const offlineUsers = totalUsers - onlineUsers;
   
   //const systemHealth = await analyzeSystemHealth();
-  import os from "os";
-import process from "process";
-import si from "systeminformation"; // npm install systeminformation
-
+  
 async function analyzeSystemHealth() {
   const cpuLoad = await si.currentLoad();
   const mem = await si.mem();
