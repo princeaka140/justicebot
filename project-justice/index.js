@@ -475,23 +475,17 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const welcomeTextRaw = `
 <b>Hey there, ${msg.from.first_name || ''}</b> 👋
 
-<b>Welcome to the Justice on Solana community ⚖️</b>
+Welcome to <b>Justice on Solana</b> — where fairness meets blockchain.
 
-We’re redefining <b>fairness</b> in <b>crypto</b> and <b>Web3</b> 🌐✨  
-This isn’t just a project, it’s a <b>movement</b> 🚀 for <b>accountability</b> ✅, <b>protection</b> 🛡️ and <b>transparency</b> 🔍 through <b>smart contracts</b> and <b>community governance</b> 🤝
+This isn’t just another project — it’s a <b>movement</b>.
 
-<b>As a member, you’ll:</b>  
-• 🪙 Get updates on milestones and drops  
-• 🧠 Discuss blockchain law & DeFi safety  
-• 🤝 Connect with advocates and builders  
-• 🧩 Help shape decentralized justice on Solana  
+• Stay updated on milestones and drops.
+• Discuss blockchain law & DeFi protection.
+• Connect with innovators and justice advocates.
 
-<b>Your voice matters here.</b>  
-Together we build a <b>fairer</b>, <b>safer</b> Web3 🔐✨  
+Together, we’re building a <b>fairer, safer, and more transparent Web3</b>.
 
-<i>On-chain justice is unstoppable</i> ♾️⚖️  
-#JusticeOnSolana #Solana #Web3 #CryptoLaw
-
+⚖️ <i>#JusticeOnSolana #Web3 #CryptoLaw</i>
 `;
 
   const welcomeText = sanitizeHtmlForTelegram(welcomeTextRaw);
