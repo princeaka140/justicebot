@@ -104,7 +104,7 @@ async function initializeBotDatabase() {
 initializeBotDatabase();
 
 /* ---------- Config constants ---------- */
-const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(Number) : [7561048693, 6450400107, 5470178483, 5713536787, 6221435595, 5713536787, -1003140359659];
+const ADMIN_IDS = [ 7561048693, 6450400107, 5470178483, 5713536787, 6221435595, -1003140359659];
 const ADMIN_GROUP_ID = Number(process.env.ADMIN_GROUP_ID || -1003140359659);
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL || "@livetransactiontrack";
 
