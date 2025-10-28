@@ -475,23 +475,21 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const welcomeTextRaw = `
 <b>Hey there, ${msg.from.first_name || ''}</b> 👋
 
-<b>Welcome to the Justice on Solana community ⚖️</b> — where we’re redefining what <b>fairness</b> means in the world of <b>crypto</b> and <b>Web3</b> 🌐✨
+<b>Welcome to the Justice on Solana community ⚖️</b>
 
-This isn’t just another blockchain project.  
-It’s a <b>movement</b> 🚀 — a mission to bring <b>accountability</b> ✅, <b>protection</b> 🛡️, and <b>transparency</b> 🔍 to the decentralized world through <b>smart contracts</b> 📜, <b>on-chain arbitration</b> ⚖️, and <b>community-driven governance</b> 🤝
+We’re redefining <b>fairness</b> in <b>crypto</b> and <b>Web3</b> 🌐✨  
+This isn’t just a project, it’s a <b>movement</b> 🚀 for <b>accountability</b> ✅, <b>protection</b> 🛡️ and <b>transparency</b> 🔍 through <b>smart contracts</b> and <b>community governance</b> 🤝
 
-<b>Here’s what you can expect as a member:</b>
-
-• 🪙 Stay updated on project milestones and token drops  
-• 🧠 Participate in discussions on blockchain law and DeFi protection  
-• 🤝 Connect with innovators, builders, and justice advocates  
-• 🧩 Be part of the first decentralized legal ecosystem on Solana  
+<b>As a member, you’ll:</b>  
+• 🪙 Get updates on milestones and drops  
+• 🧠 Discuss blockchain law & DeFi safety  
+• 🤝 Connect with advocates and builders  
+• 🧩 Help shape decentralized justice on Solana  
 
 <b>Your voice matters here.</b>  
-Together, we’re building a <b>fairer</b>, <b>safer</b>, and more <b>transparent Web3</b> 🔐✨
+Together we build a <b>fairer</b>, <b>safer</b> Web3 🔐✨  
 
-<b>Welcome to the future of justice</b> — <i>on-chain and unstoppable</i> ♾️⚖️
-
+<i>On-chain justice is unstoppable</i> ♾️⚖️  
 #JusticeOnSolana #Solana #Web3 #CryptoLaw
 
 `;
