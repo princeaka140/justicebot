@@ -1152,9 +1152,10 @@ bot.onText(/\/requestwithdraw\s+(.+)/, async (msg, match) => {
 
 bot.onText(/\/health/, async (msg) => {
   const chatId = msg.chat.id;
-  const adminId = 123456789; // replace with YOUR Telegram user ID
+  const userId = msg.from.id; // ✅ This is your actual Telegram ID
 
-  if (chatId !== adminId) {
+  // ✅ Proper admin check using your ADMIN_IDS array
+  if (!isAdminId(userId)) {
     return bot.sendMessage(chatId, "🚫 Access denied. Admins only.");
   }
 
@@ -1163,7 +1164,7 @@ bot.onText(/\/health/, async (msg) => {
     await bot.sendMessage(chatId, healthReport, { parse_mode: "Markdown" });
   } catch (err) {
     console.error("Health command error:", err);
-    bot.sendMessage(chatId, "❌ Failed to fetch system health.");
+    await bot.sendMessage(chatId, "❌ Failed to fetch system health.");
   }
 });
 
