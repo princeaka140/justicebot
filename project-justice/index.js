@@ -402,8 +402,9 @@ bot.on('message', async (m) => {
       ],
       [
         { text: ch[3], url: ch[3].startsWith("http") ? ch[3] : `https://t.me/${ch[3].replace(/^@/, '')}` },
-        { text: ch[4], url: ch[4].startsWith("http") ? ch[4] : `https://t.me/${ch[4].replace(/^@/', '')}` }
+        { text: ch[4], url: ch[4].startsWith("http") ? ch[4] : `https://t.me/${ch[4].replace(/^@/, '')}` }
       ],
+
       [{ text: "✅ Verify", callback_data: "verify_now" }]
     ];
     await bot.sendMessage(chatId, "📢 Please join all the channels below, then press Verify.", {
