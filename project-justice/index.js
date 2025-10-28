@@ -1,6 +1,7 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const si = require('systeminformation');
 const fs = require('fs');
 const path = require('path');
 const db = require('./database');
@@ -836,7 +837,36 @@ async function handleStats(chatId) {
   const onlineUsers = allUsers.filter(u => (now - u.last_seen) < 300000).length;
   const offlineUsers = totalUsers - onlineUsers;
   
-  const systemHealth = await analyzeSystemHealth();
+  //const systemHealth = await analyzeSystemHealth();
+  import os from "os";
+import process from "process";
+import si from "systeminformation"; // npm install systeminformation
+
+async function analyzeSystemHealth() {
+  const cpuLoad = await si.currentLoad();
+  const mem = await si.mem();
+  const netStats = await si.networkStats();
+
+  const cpu = cpuLoad.currentLoad.toFixed(1);
+  const ramUsed = (mem.active / 1024 / 1024 / 1024).toFixed(2);
+  const ramTotal = (mem.total / 1024 / 1024 / 1024).toFixed(2);
+  const netIn = (netStats[0].rx_sec / 1024).toFixed(1);
+  const netOut = (netStats[0].tx_sec / 1024).toFixed(1);
+  const uptime = (process.uptime() / 60).toFixed(1);
+
+  const heart = cpu < 50 ? "💚" : cpu < 80 ? "💛" : "❤️‍🔥";
+
+  return `
+⚙️ *System Health Report* ${heart}
+
+🧠 *CPU Load:* ${cpu}%
+💾 *Memory:* ${ramUsed}GB / ${ramTotal}GB
+🌐 *Network:* ${netIn}KB/s ⬇️ | ${netOut}KB/s ⬆️
+⏱️ *Uptime:* ${uptime} minutes
+🚦 *Status:* ${heart} ${cpu < 80 ? "Stable" : "High Load"}
+  `;
+}
+
   const totalBalance = await db.getTotalBalance();
   
   const statsText = `📊 System Statistics\n\n` +
@@ -1120,6 +1150,24 @@ bot.onText(/\/requestwithdraw\s+(.+)/, async (msg, match) => {
   const newBalance = parseFloat(user.balance) - amount;
   await db.updateUser(userId, { balance: newBalance });
 });
+
+bot.onText(/\/health/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = 123456789; // replace with YOUR Telegram user ID
+
+  if (chatId !== adminId) {
+    return bot.sendMessage(chatId, "🚫 Access denied. Admins only.");
+  }
+
+  try {
+    const healthReport = await analyzeSystemHealth();
+    await bot.sendMessage(chatId, healthReport, { parse_mode: "Markdown" });
+  } catch (err) {
+    console.error("Health command error:", err);
+    bot.sendMessage(chatId, "❌ Failed to fetch system health.");
+  }
+});
+
 
 bot.onText(/\/addtask (.+) \| (.+) \| (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
