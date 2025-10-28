@@ -1,6 +1,8 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const db = require('./database');
 
 const app = express();
@@ -228,6 +230,211 @@ function getStarRating(percentage) {
   return "❌❌❌❌❌";
 }
 
+/**
+ * Helper: Detect http(s) url
+ */
+function isHttpUrl(str) {
+  try {
+    const url = new URL(str);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Robust helper for sending welcome media:
+ * - Accepts local file path, Telegram file_id, or direct media URL (mp4/webm/gif).
+ * - If provided a web page URL (Vimeo page or similar), it will send the welcome text with a Watch button instead.
+ */
+async function trySendVideoOrAnimation(source, chatId, welcomeText, replyKeyboard) {
+  const directMediaExt = /\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i;
+  const isUrl = typeof source === 'string' && isHttpUrl(source);
+  const isLocalFile = typeof source === 'string' && fs.existsSync(source);
+  const looksLikeDirectMedia = (isUrl && directMediaExt.test(source)) || isLocalFile;
+
+  // If it's a webpage URL (Vimeo/watch page), send as text + watch button
+  if (isUrl && !looksLikeDirectMedia) {
+    console.log('Info: welcome source is a webpage — sending text with link button.');
+    const inline = { inline_keyboard: [[{ text: "▶️ Watch video", url: source }]] };
+    try {
+      await bot.sendMessage(chatId, welcomeText, {
+        parse_mode: 'HTML',
+        reply_markup: { ...replyKeyboard, inline_keyboard: inline.inline_keyboard }
+      });
+    } catch (err) {
+      console.error('Failed to send fallback welcome message:', err && (err.response?.body || err.message || err));
+    }
+    return;
+  }
+
+  // If local file exists, stream it
+  if (isLocalFile) {
+    try {
+      const stream = fs.createReadStream(source);
+      const res = await bot.sendVideo(chatId, stream, {
+        caption: welcomeText,
+        parse_mode: 'HTML',
+        reply_markup: replyKeyboard
+      });
+      console.log('✅ Sent local video file. file_id:', res.video && res.video.file_id);
+      return;
+    } catch (err) {
+      console.warn('sendVideo from local file failed:', err && (err.response?.body || err.message || err));
+      // fall through to trying other methods
+    }
+  }
+
+  // Try sending as video (works for file_id or direct media URL)
+  try {
+    const res = await bot.sendVideo(chatId, source, {
+      caption: welcomeText,
+      parse_mode: 'HTML',
+      reply_markup: replyKeyboard
+    });
+    console.log('✅ Sent as video (file_id or direct URL). file_id:', res.video && res.video.file_id);
+    return;
+  } catch (videoError) {
+    console.warn('sendVideo failed:', videoError && (videoError.response?.body || videoError.message || videoError));
+    // Try as animation (GIF)
+    try {
+      const res2 = await bot.sendAnimation(chatId, source, {
+        caption: welcomeText,
+        parse_mode: 'HTML',
+        reply_markup: replyKeyboard
+      });
+      console.log('✅ Sent as animation. file_id:', res2.animation && res2.animation.file_id);
+      return;
+    } catch (animError) {
+      console.warn('sendAnimation failed:', animError && (animError.response?.body || animError.message || animError));
+      // Finally, fallback to sendMessage
+      try {
+        await bot.sendMessage(chatId, welcomeText, {
+          parse_mode: 'HTML',
+          reply_markup: replyKeyboard
+        });
+        console.log('✅ Sent fallback welcome text');
+      } catch (msgErr) {
+        console.error('❌ Failed to send fallback welcome text:', msgErr && (msgErr.response?.body || msgErr.message || msgErr));
+      }
+    }
+  }
+}
+
+// Map to track admin upload flow for /introvideo
+const awaitingIntroUpload = {};
+
+// Log incoming file_ids (temporary/permanent) and handle admin intro uploads if in flow
+bot.on('message', async (m) => {
+  if (!m.from || m.from.is_bot) return;
+  const uid = m.from.id;
+
+  // Log any incoming media file ids for debugging
+  try {
+    if (m.video) console.log('Received video file_id:', m.video.file_id);
+    if (m.animation) console.log('Received animation file_id:', m.animation.file_id);
+    if (m.document) console.log('Received document file_id:', m.document.file_id);
+  } catch (e) {}
+
+  // If admin is in intro upload flow, handle saving intro
+  if (awaitingIntroUpload[uid]) {
+    const chatId = m.chat.id;
+    try {
+      // Video
+      if (m.video) {
+        await db.setSetting('introVideo', m.video.file_id);
+        await db.setSetting('introVideoType', 'video');
+        await bot.sendMessage(chatId, '✅ Intro video saved (video.file_id).');
+        delete awaitingIntroUpload[uid];
+        return;
+      }
+      // Animation (GIF)
+      if (m.animation) {
+        await db.setSetting('introVideo', m.animation.file_id);
+        await db.setSetting('introVideoType', 'animation');
+        await bot.sendMessage(chatId, '✅ Intro animation saved (animation.file_id).');
+        delete awaitingIntroUpload[uid];
+        return;
+      }
+      // Document (file)
+      if (m.document) {
+        await db.setSetting('introVideo', m.document.file_id);
+        await db.setSetting('introVideoType', 'document');
+        await bot.sendMessage(chatId, '✅ Intro saved as document (document.file_id).');
+        delete awaitingIntroUpload[uid];
+        return;
+      }
+      // Text: file_id or URL
+      if (m.text && m.text.trim()) {
+        const text = m.text.trim();
+        if (/^https?:\/\//i.test(text)) {
+          const type = (/\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i.test(text)) ? 'url_media' : 'url_page';
+          await db.setSetting('introVideo', text);
+          await db.setSetting('introVideoType', type);
+          await bot.sendMessage(chatId, `✅ Intro saved as URL (type: ${type}).`);
+        } else {
+          await db.setSetting('introVideo', text);
+          await db.setSetting('introVideoType', 'file_id');
+          await bot.sendMessage(chatId, '✅ Intro saved as file_id.');
+        }
+        delete awaitingIntroUpload[uid];
+        return;
+      }
+
+      await bot.sendMessage(chatId, '❌ Unsupported message. Please send a video, animation (GIF), document, or paste a file_id/URL. Send /cancelintro to abort.');
+    } catch (err) {
+      console.error('Error saving intro media:', err && (err.response?.body || err.message || err));
+      await bot.sendMessage(m.chat.id, '❌ Failed to save intro. Check server logs for details.');
+      delete awaitingIntroUpload[uid];
+    }
+  }
+});
+
+// Admin command: /introvideo [file_id|url] — start flow or save direct param
+bot.onText(/\/introvideo(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+
+  const param = match[1] && match[1].trim();
+  if (param) {
+    const isUrl = /^https?:\/\//i.test(param);
+    const type = isUrl
+      ? (/\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i.test(param) ? 'url_media' : 'url_page')
+      : 'file_id';
+
+    await db.setSetting('introVideo', param);
+    await db.setSetting('introVideoType', type);
+    await bot.sendMessage(chatId, `✅ Intro source saved (type: ${type}).`);
+    return;
+  }
+
+  awaitingIntroUpload[adminId] = true;
+  await bot.sendMessage(chatId, "📤 Send the intro video now (as video/animation/document) or paste a file_id / direct URL (or send /cancelintro to abort).");
+});
+
+bot.onText(/\/cancelintro/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  if (!isAdminId(userId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  if (awaitingIntroUpload[userId]) {
+    delete awaitingIntroUpload[userId];
+    await bot.sendMessage(chatId, "❌ Intro upload cancelled.");
+  } else {
+    await bot.sendMessage(chatId, "ℹ️ No intro upload in progress.");
+  }
+});
+
+/**
+ * /start handler: use saved intro if present in DB; otherwise fall back to local file or URL behavior.
+ */
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -243,8 +450,8 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     }
   }
 
-  // Your media file_id — can be a GIF or a video
-  const welcomeVideo = 'CgACAgQAAxkBAAID3GkAAQzUoke15DSdRceHB1GOyu8x9QACqB0AAoMcAVDmEWSRpUxdUjYE';
+  // Local file path fallback (if you keep a copy in the project)
+  const localWelcomePath = path.join(__dirname, 'project-justice', 'intro.mp4');
 
   // Welcome text (HTML mode)
   const welcomeText = `
@@ -264,40 +471,46 @@ Together, we’re building a <b>fairer, safer, and more transparent Web3</b>.<br
     one_time_keyboard: true
   };
 
-  // Helper to test if file_id is a valid video or animation
-  async function trySendVideoOrAnimation() {
-    try {
-      // Try sending as a video first
-      await bot.sendVideo(chatId, welcomeVideo, {
-        caption: welcomeText,
-        parse_mode: 'HTML',
-        reply_markup: keyboard
-      });
-      console.log('✅ Sent as video');
-    } catch (videoError) {
-      console.warn('❌ Video send failed, trying as animation...', videoError.description);
-      try {
-        // If video fails, send as animation (GIF)
-        await bot.sendAnimation(chatId, welcomeVideo, {
-          caption: welcomeText,
-          parse_mode: 'HTML',
-          reply_markup: keyboard
-        });
-        console.log('✅ Sent as animation');
-      } catch (animError) {
-        console.error('❌ Both video and animation failed:', animError.description);
-        await bot.sendMessage(chatId, welcomeText, {
-          parse_mode: 'HTML',
-          reply_markup: keyboard
-        });
+  try {
+    const savedIntro = await db.getSetting('introVideo'); // file_id or URL or local path
+    const savedType = await db.getSetting('introVideoType'); // optional type
+
+    if (savedIntro) {
+      // If document-type, explicitly sendDocument
+      if (savedType === 'document') {
+        try {
+          await bot.sendDocument(chatId, savedIntro, {
+            caption: welcomeText,
+            parse_mode: 'HTML',
+            reply_markup: keyboard
+          });
+          console.log('✅ Sent saved document intro');
+        } catch (err) {
+          console.warn('sendDocument failed, falling back to trySendVideoOrAnimation:', err && (err.response?.body || err.message || err));
+          await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+        }
+      } else {
+        // savedType could be 'video', 'animation', 'file_id', 'url_media', 'url_page'
+        await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+      }
+    } else {
+      // No saved intro: prefer local file if exists, else fallback to a default link or just text
+      if (fs.existsSync(localWelcomePath)) {
+        await trySendVideoOrAnimation(localWelcomePath, chatId, welcomeText, keyboard);
+      } else {
+        // You can set a default URL here if desired; using Vimeo page in fallback will produce a text+button
+        const defaultUrl = 'https://vimeo.com/1131147244?share=copy&fl=sv&fe=ci';
+        await trySendVideoOrAnimation(defaultUrl, chatId, welcomeText, keyboard);
       }
     }
+  } catch (e) {
+    console.error('Error in /start welcome flow:', e && (e.response?.body || e.message || e));
+    // final fallback to text
+    try {
+      await bot.sendMessage(chatId, welcomeText, { parse_mode: 'HTML', reply_markup: keyboard });
+    } catch (err) {}
   }
-
-  await trySendVideoOrAnimation();
 });
-
-
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
