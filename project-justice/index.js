@@ -34,7 +34,7 @@ if (!token) {
   process.exit(1);
 }
 
-// Create bot WITHOUT polling — we'll use webhook
+// Create bot WITHOUT polling — we'll use webhook and manual processing of updates
 const bot = new TelegramBot(token);
 
 // Webhook configuration
@@ -824,16 +824,6 @@ bot.on('callback_query', async (query) => {
 
 /* ---------- Remaining command handlers (admin & user commands) ----------
    These functions are the same as your working implementations and are included verbatim.
-   For brevity they are pasted directly below. You can adjust them if needed.
-*/
-
-/* showMenu, handleTask, handleBonus, handleSetWallet, handleReferral, handleBalance,
-   handleWithdrawalMenu, handleStats, finishTaskSubmit, handleAdminTaskConfirm,
-   handleAdminTaskReject, handleAdminWithdrawConfirm, handleAdminWithdrawReject,
-   /requestwithdraw, /addtask, /deletetask, /listtasks, /setconfig, /getconfig,
-   /broadcast, /userinfo, /addbalance, /removebalance, /approveall, /rejectall,
-   /pendingsubmissions, /openwithdrawal, /closewithdrawal, /stats, /referral,
-   /leaderboard, /aboutus, /support, /bonus, /referralreward
 */
 
 /* (Below: verbatim implementations from your original working code) */
