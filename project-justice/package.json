@@ -2,9 +2,12 @@
   "name": "telegram-justice-bot",
   "version": "1.0.0",
   "description": "JUSTICE on Sol Telegram Bot",
-  "main": "index.js",
+  "main": "project-justice/index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node project-justice/index.js"
+  },
+  "engines": {
+    "node": "18.x"
   },
   "keywords": [
     "telegram",
