@@ -7,7 +7,7 @@
     "start": "node project-justice/index.js"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=18 <21"
   },
   "keywords": [
     "telegram",
