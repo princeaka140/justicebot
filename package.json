@@ -4,7 +4,7 @@
   "description": "JUSTICE on Sol Telegram Bot",
   "main": "project-justice/index.js",
   "scripts": {
-    "start": "node start-bot.js"
+    "start": "node project-justice/index.js"
   },
   "engines": {
     "node": ">=18 <21"
