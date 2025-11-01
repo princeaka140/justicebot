@@ -18,6 +18,16 @@ app.get('/', (req, res) => {
   res.send("I'm alive! Bot is running.");
 });
 
+// Optional endpoint to trigger webhook setup manually (useful for debugging)
+app.get('/setup-webhook', async (req, res) => {
+  try {
+    await setupWebhook();
+    res.send("Webhook setup attempted - check logs.");
+  } catch (e) {
+    res.status(500).send("Failed to setup webhook, see logs.");
+  }
+});
+
 const token = process.env.BOT_TOKEN;
 if (!token) {
   console.error('Error: BOT_TOKEN is not set in environment variables');
@@ -324,6 +334,68 @@ function patchSend(method) {
   patchSend
 );
 
+/* ---------- ADMIN: /introvideo and /cancelintro handlers ---------- */
+/*
+  Usage:
+   - /introvideo                -> enter interactive upload mode (send media, URL, or file_id)
+   - /introvideo <url-or-fileid> -> quick set (no upload mode)
+   - /cancelintro               -> cancel interactive mode
+*/
+bot.onText(/\/introvideo(?:\s+(.+))?/, async (msg, match) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  if (!isAdminId(userId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+
+  const param = match && match[1] ? match[1].trim() : null;
+  if (param) {
+    // Quick-set mode: admin provided a URL or file_id inline
+    try {
+      if (/^https?:\/\//i.test(param)) {
+        const type = (/\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i.test(param)) ? 'url_media' : 'url_page';
+        await db.setSetting('introVideo', param);
+        await db.setSetting('introVideoType', type);
+        await bot.sendMessage(chatId, `✅ Intro saved as URL (type: ${type}).`);
+      } else {
+        // treat as file_id or text
+        const t = param;
+        const inferredType = /^\d+:[A-Za-z0-9_-]+$/.test(t) ? 'file_id' : 'file_id';
+        await db.setSetting('introVideo', t);
+        await db.setSetting('introVideoType', inferredType);
+        await bot.sendMessage(chatId, '✅ Intro saved as file_id/text.');
+      }
+    } catch (err) {
+      console.error('Error saving intro (quick mode):', err && (err.response?.body || err.message || err));
+      await bot.sendMessage(chatId, '❌ Failed to save intro. Check server logs for details.');
+    }
+    return;
+  }
+
+  // Interactive mode
+  awaitingIntroUpload[userId] = true;
+  await bot.sendMessage(chatId, '📹 Please send the intro video, animation (GIF), document, file_id, or media/web URL. Send /cancelintro to abort.');
+});
+
+bot.onText(/\/cancelintro/, async (msg) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  if (!isAdminId(userId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+
+  if (awaitingIntroUpload[userId]) {
+    delete awaitingIntroUpload[userId];
+    await bot.sendMessage(chatId, '❌ Intro upload cancelled.');
+  } else {
+    await bot.sendMessage(chatId, 'No intro upload in progress.');
+  }
+});
+
 /* ---------- Single 'message' handler:
    - logs incoming file_ids
    - handles /introvideo admin upload flow
@@ -335,11 +407,15 @@ bot.on('message', async (m) => {
   const chatId = m.chat.id;
   const text = m.text;
 
+  // Debug logging for incoming update
+  console.log(`Incoming message from ${uid} in chat ${chatId} - text: ${text ? text.substring(0,80) : '<no text>'}`);
+
   // Log incoming file_ids for debugging
   try {
     if (m.video) console.log('Received video file_id:', m.video.file_id);
     if (m.animation) console.log('Received animation file_id:', m.animation.file_id);
     if (m.document) console.log('Received document file_id:', m.document.file_id);
+    if (m.photo) console.log('Received photo file_ids:', m.photo.map(p => p.file_id).join(','));
   } catch (e) {}
 
   // If admin is in intro upload flow, handle saving intro (higher priority)
@@ -366,6 +442,15 @@ bot.on('message', async (m) => {
         delete awaitingIntroUpload[uid];
         return;
       }
+      if (m.photo) {
+        // Accept first photo as intro document (optional)
+        const photo = m.photo[m.photo.length - 1];
+        await db.setSetting('introVideo', photo.file_id);
+        await db.setSetting('introVideoType', 'photo');
+        await bot.sendMessage(chatId, '✅ Intro saved as photo.');
+        delete awaitingIntroUpload[uid];
+        return;
+      }
       if (m.text && m.text.trim()) {
         const t = m.text.trim();
         if (/^https?:\/\//i.test(t)) {
@@ -374,15 +459,16 @@ bot.on('message', async (m) => {
           await db.setSetting('introVideoType', type);
           await bot.sendMessage(chatId, `✅ Intro saved as URL (type: ${type}).`);
         } else {
+          // treat as file_id or raw file id text
           await db.setSetting('introVideo', t);
           await db.setSetting('introVideoType', 'file_id');
-          await bot.sendMessage(chatId, '✅ Intro saved as file_id.');
+          await bot.sendMessage(chatId, '✅ Intro saved as file_id/text.');
         }
         delete awaitingIntroUpload[uid];
         return;
       }
 
-      await bot.sendMessage(chatId, '❌ Unsupported message. Please send a video, animation (GIF), document, or paste a file_id/URL. Send /cancelintro to abort.');
+      await bot.sendMessage(chatId, '❌ Unsupported message. Please send a video, animation (GIF), document, photo, or paste a file_id/URL. Send /cancelintro to abort.');
     } catch (err) {
       console.error('Error saving intro media:', err && (err.response?.body || err.message || err));
       await bot.sendMessage(chatId, '❌ Failed to save intro. Check server logs for details.');
@@ -501,18 +587,21 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const username = msg.from.username || "";
   const startParam = match[1];
 
-  await db.ensureUser(userId, username);
+  console.log(`/start triggered by ${userId}. param: ${startParam || '<none>'}`);
 
-  if (startParam && startParam !== String(userId)) {
-    const user = await db.getUser(userId);
-    if (!user.referred_by) {
-      await db.updateUser(userId, { referred_by: startParam });
+  try {
+    await db.ensureUser(userId, username);
+
+    if (startParam && startParam !== String(userId)) {
+      const user = await db.getUser(userId);
+      if (!user.referred_by) {
+        await db.updateUser(userId, { referred_by: startParam });
+      }
     }
-  }
 
-  const localWelcomePath = path.join(__dirname, 'project-justice', 'intro.mp4');
+    const localWelcomePath = path.join(__dirname, 'project-justice', 'intro.mp4');
 
-  const welcomeTextRaw = `
+    const welcomeTextRaw = `
 <b>Hey there, ${msg.from.first_name || ''}</b> 👋
 
 Welcome to the <b>Justice on Solana</b> community ⚖️
@@ -533,59 +622,76 @@ Together we build a <b>fairer, safer Web3 🔐✨</b>
 <i>#JusticeOnSolana #Solana #Web3 #CryptoLaw</i>
 `;
 
-  const welcomeText = sanitizeHtmlForTelegram(welcomeTextRaw);
+    const welcomeText = sanitizeHtmlForTelegram(welcomeTextRaw);
 
-  const keyboard = {
-    keyboard: [["➡️ Continue"]],
-    resize_keyboard: true,
-    one_time_keyboard: true
-  };
+    const keyboard = {
+      keyboard: [["➡️ Continue"]],
+      resize_keyboard: true,
+      one_time_keyboard: true
+    };
 
-  try {
-    const savedIntro = await db.getSetting('introVideo');
-    const savedType = await db.getSetting('introVideoType');
+    try {
+      const savedIntro = await db.getSetting('introVideo');
+      const savedType = await db.getSetting('introVideoType');
 
-    if (savedIntro) {
-      if (savedType === 'document') {
-        try {
-          await bot.sendDocument(chatId, savedIntro, {
-            caption: welcomeText,
-            parse_mode: 'HTML',
-            reply_markup: keyboard
-          });
-        } catch (err) {
-          console.warn('sendDocument failed, falling back:', err && (err.response?.body || err.message || err));
-          await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
-        }
-      } else if (savedType === 'animation') {
-        try {
-          await bot.sendAnimation(chatId, savedIntro, {
-            caption: welcomeText,
-            parse_mode: 'HTML',
-            reply_markup: keyboard
-          });
-        } catch (err) {
-          console.warn('sendAnimation failed, falling back:', err && (err.response?.body || err.message || err));
+      if (savedIntro) {
+        if (savedType === 'document') {
+          try {
+            await bot.sendDocument(chatId, savedIntro, {
+              caption: welcomeText,
+              parse_mode: 'HTML',
+              reply_markup: keyboard
+            });
+          } catch (err) {
+            console.warn('sendDocument failed, falling back:', err && (err.response?.body || err.message || err));
+            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+          }
+        } else if (savedType === 'animation') {
+          try {
+            await bot.sendAnimation(chatId, savedIntro, {
+              caption: welcomeText,
+              parse_mode: 'HTML',
+              reply_markup: keyboard
+            });
+          } catch (err) {
+            console.warn('sendAnimation failed, falling back:', err && (err.response?.body || err.message || err));
+            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+          }
+        } else if (savedType === 'photo') {
+          try {
+            await bot.sendPhoto(chatId, savedIntro, {
+              caption: welcomeText,
+              parse_mode: 'HTML',
+              reply_markup: keyboard
+            });
+          } catch (err) {
+            console.warn('sendPhoto failed, falling back:', err && (err.response?.body || err.message || err));
+            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+          }
+        } else {
           await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
         }
       } else {
-        await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
+        if (fs.existsSync(localWelcomePath)) {
+          await trySendVideoOrAnimation(localWelcomePath, chatId, welcomeText, keyboard);
+        } else {
+          const defaultUrl = 'https://vimeo.com/1131147244?share=copy&fl=sv&fe=ci';
+          await trySendVideoOrAnimation(defaultUrl, chatId, welcomeText, keyboard);
+        }
       }
-    } else {
-      if (fs.existsSync(localWelcomePath)) {
-        await trySendVideoOrAnimation(localWelcomePath, chatId, welcomeText, keyboard);
-      } else {
-        const defaultUrl = 'https://vimeo.com/1131147244?share=copy&fl=sv&fe=ci';
-        await trySendVideoOrAnimation(defaultUrl, chatId, welcomeText, keyboard);
+    } catch (e) {
+      console.error('Error in /start welcome flow:', e && (e.response?.body || e.message || e));
+      try {
+        await bot.sendMessage(chatId, welcomeText, { parse_mode: 'HTML', reply_markup: keyboard });
+      } catch (err) {
+        console.error('Final fallback sendMessage failed:', err && (err.response?.body || err.message || err));
       }
     }
   } catch (e) {
-    console.error('Error in /start welcome flow:', e && (e.response?.body || e.message || e));
+    console.error('Unhandled error in /start handler:', e && (e.response?.body || e.message || e));
     try {
-      await bot.sendMessage(chatId, welcomeText, { parse_mode: 'HTML', reply_markup: keyboard });
-    } catch (err) {
-      console.error('Final fallback sendMessage failed:', err && (err.response?.body || err.message || err));
-    }
+      await bot.sendMessage(chatId, '❌ An error occurred while processing /start. Please try again later.');
+    } catch (err) {}
   }
 });
 
@@ -841,6 +947,13 @@ async function handleStats(chatId) {
 
   const totalBalance = await db.getTotalBalance();
   
+  // Note: systemHealth referenced here in original code; keep compatibility
+  const systemHealth = {
+    realUsers: 'N/A',
+    suspiciousUsers: 'N/A',
+    score: 'N/A'
+  };
+
   const statsText = `📊 System Statistics\n\n` +
     `Total Users: ${totalUsers}\n` +
     `Real Users: ${systemHealth.realUsers}\n` +
@@ -1322,7 +1435,8 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
 
   const refCount = await db.getReferralCount(targetId);
   const completedTasks = await db.getUserCompletedTasks(targetId);
-  const refAnalysis = await analyzeReferralPattern(targetId);
+  // analyzeReferralPattern not defined in snippet - keep placeholder
+  const refAnalysis = { realRefs: 'N/A', suspiciousRefs: 'N/A', score: 'N/A' };
 
   const info = `👤 User Info\n\n` +
     `ID: ${user.id}\n` +
@@ -1341,11 +1455,6 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
 
   await bot.sendMessage(chatId, info);
 });
-
-/* Additional admin commands (/addbalance, /removebalance, /approveall, /rejectall, /pendingsubmissions,
-   /openwithdrawal, /closewithdrawal, /stats, /referral, /leaderboard, /aboutus, /support, /bonus, /referralreward)
-   are already implemented above or can be inserted similarly. Keep them as in your working file.
-*/
 
 /* Final: Keep console log so you know the bot started */
 console.log("Bot webhook server is running and handlers are registered.");
