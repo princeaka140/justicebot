@@ -34,7 +34,7 @@ if (!token) {
   process.exit(1);
 }
 
-// Create bot WITHOUT polling — we'll use webhook and manual processing of updates
+// Create bot WITHOUT polling — we'll use webhook
 const bot = new TelegramBot(token);
 
 // Webhook configuration
@@ -145,6 +145,7 @@ const BOT_NAME = "JUSTICE on Sol";
 let pendingTasks = {};
 let awaitingWallet = {};
 const awaitingIntroUpload = {}; // admin flow for /introvideo
+global.userLatestMessage = {}; // Track last message per user per chat
 
 /* ---------- Utility helpers (copied & merged from working code) ---------- */
 function isAdminId(id) {
@@ -213,6 +214,34 @@ async function sendAutoDeleteMessage(chatId, text, timeout = 120000) {
     return msg;
   } catch (e) {
     return null;
+  }
+}
+
+// =============== Auto-delete helper ====================
+async function sendAndAutoDelete(chatId, text, timeout = 30000, options = {}) {
+  try {
+    const sent = await bot.sendMessage(chatId, text, options);
+    setTimeout(() => {
+      bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+    }, timeout);
+    return sent;
+  } catch (e) { 
+    return null; 
+  }
+}
+
+async function deleteMessageLater(chatId, message_id, timeout = 30000) {
+  setTimeout(() => {
+    bot.deleteMessage(chatId, message_id).catch(() => {});
+  }, timeout);
+}
+
+// Broadcast helper (review/admin channel notification)
+async function broadcastAdminAction(msgText) {
+  try {
+    await bot.sendMessage(TASK_REVIEW_CHANNEL, msgText);
+  } catch (e) {
+    console.error('Error broadcasting admin action:', e && e.message);
   }
 }
 
@@ -824,6 +853,16 @@ bot.on('callback_query', async (query) => {
 
 /* ---------- Remaining command handlers (admin & user commands) ----------
    These functions are the same as your working implementations and are included verbatim.
+   For brevity they are pasted directly below. You can adjust them if needed.
+*/
+
+/* showMenu, handleTask, handleBonus, handleSetWallet, handleReferral, handleBalance,
+   handleWithdrawalMenu, handleStats, finishTaskSubmit, handleAdminTaskConfirm,
+   handleAdminTaskReject, handleAdminWithdrawConfirm, handleAdminWithdrawReject,
+   /requestwithdraw, /addtask, /deletetask, /listtasks, /setconfig, /getconfig,
+   /broadcast, /userinfo, /addbalance, /removebalance, /approveall, /rejectall,
+   /pendingsubmissions, /openwithdrawal, /closewithdrawal, /stats, /referral,
+   /leaderboard, /aboutus, /support, /bonus, /referralreward
 */
 
 /* (Below: verbatim implementations from your original working code) */
@@ -938,10 +977,31 @@ async function handleStats(chatId) {
   const totalBalance = await db.getTotalBalance();
   
   // Note: systemHealth referenced here in original code; keep compatibility
+  // Analyze all users for system health
+  let realUsers = 0;
+  let suspiciousUsers = 0;
+  
+  for (const user of allUsers) {
+    const analysis = await db.analyzeReferralPattern(user.id);
+    if (parseFloat(analysis.percentage) >= 50) {
+      realUsers++;
+    } else {
+      suspiciousUsers++;
+    }
+  }
+  
+  const healthPercentage = totalUsers > 0 ? (realUsers / totalUsers) * 100 : 0;
+  let healthScore;
+  if (healthPercentage >= 80) healthScore = '⭐⭐⭐⭐⭐';
+  else if (healthPercentage >= 60) healthScore = '⭐⭐⭐⭐';
+  else if (healthPercentage >= 40) healthScore = '⭐⭐⭐';
+  else if (healthPercentage >= 20) healthScore = '⭐⭐';
+  else healthScore = '⭐';
+
   const systemHealth = {
-    realUsers: 'N/A',
-    suspiciousUsers: 'N/A',
-    score: 'N/A'
+    realUsers,
+    suspiciousUsers,
+    score: healthScore
   };
 
   const statsText = `📊 System Statistics\n\n` +
@@ -967,10 +1027,26 @@ async function finishTaskSubmit(userId, chatId) {
     await bot.sendMessage(chatId, "❌ Error: At least one image/screenshot is required. Please upload an image before submitting.");
     return;
   }
-
   const userIdentifier = await getUserIdentifier(userId);
-  const caption = `📝 New Task Submission\nUser: ${userIdentifier}\nTask: ${pending.taskTitle || 'Unknown'}\nReward: ${pending.taskReward || 0} ${CURRENCY_SYMBOL}\n\nDescription:\n${pending.text || "(no description)"}\n\nImages: ${pending.files.length}`;
-  
+
+// Get full task details from DB so we can include its original description
+const task = await db.getTaskById(pending.taskId);
+const taskDescription = task?.description || "(no task description)";
+const userDescription = pending.text && pending.text.trim() ? pending.text.trim() : "(no user comment)";
+
+const caption = `📝 <b>New Task Submission</b>
+User: ${userIdentifier}
+Task: <b>${pending.taskTitle || 'Unknown'}</b>
+Reward: ${pending.taskReward || 0} ${CURRENCY_SYMBOL}
+
+<b>Task Description:</b>
+${taskDescription}
+
+<b>User Comment:</b>
+${userDescription}
+
+<b>Images:</b> ${pending.files.length}`;
+
   const submission = await db.createTaskSubmission(
     userId,
     pending.taskId,
@@ -1425,25 +1501,339 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
 
   const refCount = await db.getReferralCount(targetId);
   const completedTasks = await db.getUserCompletedTasks(targetId);
-  // analyzeReferralPattern not defined in snippet - keep placeholder
-  const refAnalysis = { realRefs: 'N/A', suspiciousRefs: 'N/A', score: 'N/A' };
+  const refAnalysis = await db.analyzeReferralPattern(targetId);
+  const withdrawalStats = await db.getUserWithdrawalStats(targetId);
+  
+  // Get detailed referral breakdown
+  const referralDetails = await db.getDetailedReferralAnalysis(targetId);
+  
+  // Calculate referral earnings
+  const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
+  const totalReferralEarnings = refAnalysis.realRefs * referralReward;
 
-  const info = `👤 User Info\n\n` +
-    `ID: ${user.id}\n` +
-    `Username: ${user.username || '(none)'}\n` +
-    `Balance: ${user.balance} ${CURRENCY_SYMBOL}\n` +
-    `Wallet: ${user.wallet || '(not set)'}\n` +
-    `Verified: ${user.verified ? 'Yes' : 'No'}\n` +
-    `Referrals: ${refCount}\n` +
-    `Real Refs: ${refAnalysis.realRefs}\n` +
-    `Suspicious Refs: ${refAnalysis.suspiciousRefs}\n` +
-    `Ref Quality: ${refAnalysis.score}\n` +
-    `Completed Tasks: ${completedTasks.length}\n` +
-    `Messages: ${user.message_count}\n` +
-    `Activity Score: ${user.activity_score?.toFixed(2) || 0}\n` +
-    `Registered: ${new Date(user.registered_at).toLocaleString()}`;
+  let info = `👤 <b>User Information</b>\n\n`;
+  info += `<b>━━━━━ Basic Info ━━━━━</b>\n`;
+  info += `├ ID: <code>${user.id}</code>\n`;
+  info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
+  info += `├ Balance: <b>${user.balance} ${CURRENCY_SYMBOL}</b>\n`;
+  info += `├ Wallet: <code>${user.wallet || '(not set)'}</code>\n`;
+  info += `├ Verified: ${user.verified ? '✅ Yes' : '❌ No'}\n`;
+  info += `└ Registered: ${new Date(user.registered_at).toLocaleString()}\n\n`;
+  
+  info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
+  info += `├ Messages Sent: ${user.message_count || 0}\n`;
+  info += `├ Activity Score: ${user.activity_score?.toFixed(2) || 0}\n`;
+  info += `├ Completed Tasks: ${completedTasks.length}\n`;
+  const timeSinceLastSeen = Date.now() - user.last_seen;
+  const hoursSinceLastSeen = timeSinceLastSeen / (1000 * 60 * 60);
+  const lastSeenStr = hoursSinceLastSeen < 1 ? `${Math.floor(hoursSinceLastSeen * 60)}m ago` : 
+                      hoursSinceLastSeen < 24 ? `${Math.floor(hoursSinceLastSeen)}h ago` : 
+                      `${Math.floor(hoursSinceLastSeen / 24)}d ago`;
+  info += `└ Last Seen: ${lastSeenStr}\n\n`;
+  
+  info += `<b>━━━━━ Withdrawal Stats ━━━━━</b>\n`;
+  info += `├ Total Withdrawn: <b>${withdrawalStats.totalWithdrawn} ${CURRENCY_SYMBOL}</b>\n`;
+  info += `├ Approved: ${withdrawalStats.approvedCount}\n`;
+  info += `├ Pending: ${withdrawalStats.pendingCount}\n`;
+  info += `└ Rejected: ${withdrawalStats.rejectedCount}\n\n`;
+  
+  info += `<b>━━━━━ Referral Analysis ━━━━━</b>\n`;
+  info += `├ Total Referrals: ${refCount}\n`;
+  info += `├ Real Users: ${refAnalysis.realRefs} ✅\n`;
+  info += `├ Suspicious: ${refAnalysis.suspiciousRefs} ⚠️\n`;
+  info += `├ Quality Score: ${refAnalysis.score}\n`;
+  info += `├ Quality: ${refAnalysis.percentage}%\n`;
+  info += `└ Referral Earnings: <b>${totalReferralEarnings} ${CURRENCY_SYMBOL}</b>\n\n`;
 
-  await bot.sendMessage(chatId, info);
+  if (referralDetails.length > 0) {
+    info += `<b>━━━━━ 📋 Detailed Referral List ━━━━━</b>\n\n`;
+    
+    for (let i = 0; i < referralDetails.length; i++) {
+      const ref = referralDetails[i];
+      const num = i + 1;
+      
+      info += `<b>${num}. ${ref.username ? '@' + ref.username : 'ID: ' + ref.userId}</b>\n`;
+      info += `   ├ Status: ${ref.statusEmoji} <b>${ref.classification}</b>\n`;
+      info += `   ├ Score: ${ref.scoreStars} (${ref.totalScore}/13 points)\n`;
+      info += `   ├ Balance: ${ref.balance} ${CURRENCY_SYMBOL}\n`;
+      info += `   ├ Wallet: ${ref.wallet ? '<code>' + ref.wallet.substring(0, 20) + '...</code>' : '(not set)'}\n`;
+      info += `   ├ Messages: ${ref.messageCount} | Tasks: ${ref.completedTasks}\n`;
+      info += `   ├ Activity: ${ref.activityScore.toFixed(2)} | Age: ${ref.accountAge}\n`;
+      info += `   ├ Verified: ${ref.verified ? '✅' : '❌'} | Has Wallet: ${ref.hasWallet ? '✅' : '❌'}\n`;
+      info += `   ├ Referrals: ${ref.referralCount}\n`;
+      info += `   ├ Withdrawn: ${ref.totalWithdrawn} ${CURRENCY_SYMBOL} | Pending: ${ref.pendingWithdrawals}\n`;
+      info += `   ├ Last Seen: ${ref.lastSeen}\n`;
+      info += `   └ Registered: ${ref.registeredAt}\n\n`;
+    }
+    
+    // Add summary statistics
+    const realCount = referralDetails.filter(r => r.classification === 'Real User').length;
+    const suspiciousCount = referralDetails.filter(r => r.classification === 'Suspicious').length;
+    const botCount = referralDetails.filter(r => r.classification === 'Likely Bot').length;
+    const fakeCount = referralDetails.filter(r => r.classification === 'Fake').length;
+    
+    info += `<b>━━━━━ 📊 Classification Summary ━━━━━</b>\n`;
+    info += `✅ Real Users: ${realCount}\n`;
+    info += `⚠️ Suspicious: ${suspiciousCount}\n`;
+    info += `🤖 Likely Bots: ${botCount}\n`;
+    info += `🚫 Fake: ${fakeCount}\n`;
+  } else {
+    info += `<i>No referrals yet.</i>\n`;
+  }
+
+  await bot.sendMessage(chatId, info, { parse_mode: 'HTML' });
+});
+
+// =============== Admin Command Wrappers with Auto-Delete ===============
+
+// Blacklist with reason
+bot.onText(/\/blacklist\s+(@?\w+|\d+)(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const input = match[1].trim();
+  const reason = match[2] ? match[2].trim() : "No reason provided";
+  const targetId = await resolveUserInput(input);
+  
+  let actionMsg = `⛔️ /blacklist by admin: ${adminId} on user ${input} (${targetId})`;
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    await broadcastAdminAction(actionMsg + "\nResult: User not found.");
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  if (isAdminId(targetId)) {
+    await sendAndAutoDelete(chatId, "❌ You cannot blacklist another admin.", 30000);
+    await broadcastAdminAction(actionMsg + "\nResult: Cannot blacklist admin.");
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  await db.blacklistUser(targetId, reason, adminId);
+  await sendAndAutoDelete(chatId, `🚫 User ${input} (${targetId}) has been blacklisted.\nReason: ${reason}`, 30000);
+  await broadcastAdminAction(actionMsg + `\nReason: ${reason}\nResult: User blacklisted.`);
+  
+  // Delete admin command after 30 sec
+  deleteMessageLater(chatId, msg.message_id, 30000);
+  
+  // Delete the blacklisted user's most recent message in this chat
+  try {
+    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
+      const userMsgId = global.userLatestMessage[chatId][targetId];
+      deleteMessageLater(chatId, userMsgId, 30000);
+    }
+  } catch (e) {}
+});
+
+// Unblacklist
+bot.onText(/\/unblacklist\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  await db.unblacklistUser(targetId);
+  await sendAndAutoDelete(chatId, `✅ User ${input} (${targetId}) has been removed from blacklist.`, 30000);
+  await broadcastAdminAction(`✅ /unblacklist by admin ${adminId}: User ${input} (${targetId}) removed from blacklist.`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// List blacklisted users
+bot.onText(/\/listblacklist/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const blacklisted = await db.getAllBlacklistedUsers();
+  
+  if (blacklisted.length === 0) {
+    await sendAndAutoDelete(chatId, "📋 No blacklisted users.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  let text = "📋 Blacklisted Users:\n\n";
+  for (const entry of blacklisted) {
+    const userIdentifier = await getUserIdentifier(entry.user_id);
+    text += `User: ${userIdentifier}\nReason: ${entry.reason}\nBlacklisted at: ${new Date(entry.blacklisted_at).toLocaleString()}\n\n`;
+  }
+  
+  await sendAndAutoDelete(chatId, text, 60000);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// Addbalance
+bot.onText(/\/addbalance\s+(@?\w+|\d+)\s+(\d+)(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const input = match[1].trim();
+  const amount = parseFloat(match[2]);
+  const reason = match[3] ? match[3].trim() : "No reason provided";
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    await broadcastAdminAction(`❌ /addbalance failed by admin ${adminId}\nTarget: ${input}\nReason: User not found`);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const user = await db.getUser(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  const oldBalance = parseFloat(user.balance) || 0;
+  const newBalance = oldBalance + amount;
+  await db.updateUser(targetId, { balance: newBalance });
+  
+  await sendAndAutoDelete(chatId, `✅ Added ${amount} ${CURRENCY_SYMBOL} to ${userIdentifier}\nOld balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`, 30000);
+  await broadcastAdminAction(`💰 Balance Added\n\nAdmin: ${adminId}\nUser: ${userIdentifier}\nAmount: +${amount} ${CURRENCY_SYMBOL}\nOld Balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew Balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+  
+  // Delete user's last message if exists
+  try {
+    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
+      const userMsgId = global.userLatestMessage[chatId][targetId];
+      deleteMessageLater(chatId, userMsgId, 30000);
+    }
+  } catch (e) {}
+});
+
+// Removebalance
+bot.onText(/\/removebalance\s+(@?\w+|\d+)\s+(\d+)(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const input = match[1].trim();
+  const amount = parseFloat(match[2]);
+  const reason = match[3] ? match[3].trim() : "No reason provided";
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    await broadcastAdminAction(`❌ /removebalance failed by admin ${adminId}\nTarget: ${input}\nReason: User not found`);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const user = await db.getUser(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  const oldBalance = parseFloat(user.balance) || 0;
+  const removeAmt = Math.min(amount, oldBalance);
+  const newBalance = oldBalance - removeAmt;
+  await db.updateUser(targetId, { balance: newBalance });
+  
+  await sendAndAutoDelete(chatId, `✅ Removed ${removeAmt} ${CURRENCY_SYMBOL} from ${userIdentifier}\nOld balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`, 30000);
+  await broadcastAdminAction(`💸 Balance Deducted\n\nAdmin: ${adminId}\nUser: ${userIdentifier}\nAmount: -${removeAmt} ${CURRENCY_SYMBOL}\nOld Balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew Balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+  
+  // Delete user's last message if exists
+  try {
+    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
+      const userMsgId = global.userLatestMessage[chatId][targetId];
+      deleteMessageLater(chatId, userMsgId, 30000);
+    }
+  } catch (e) {}
+});
+
+// Open withdrawal
+bot.onText(/\/openwithdrawal/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  await db.setSetting('withdrawalOpen', 'true');
+  await sendAndAutoDelete(chatId, '✅ Withdrawals are now OPEN.', 30000);
+  await broadcastAdminAction(`🔓 Withdrawals Opened\n\nAdmin: ${adminId}\nStatus: OPEN`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// Close withdrawal
+bot.onText(/\/closewithdrawal/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  await db.setSetting('withdrawalOpen', 'false');
+  await sendAndAutoDelete(chatId, '✅ Withdrawals are now CLOSED.', 30000);
+  await broadcastAdminAction(`🔒 Withdrawals Closed\n\nAdmin: ${adminId}\nStatus: CLOSED`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// Set min and max withdrawal
+bot.onText(/\/setminandmaxwithdrawal\s+(\d+)\s+(\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const minW = parseFloat(match[1]);
+  const maxW = parseFloat(match[2]);
+  
+  await db.setSetting('minWithdrawal', minW);
+  await db.setSetting('maxWithdrawal', maxW);
+  
+  await sendAndAutoDelete(chatId, `✅ Withdrawal limits updated\nMin: ${minW} ${CURRENCY_SYMBOL}\nMax: ${maxW} ${CURRENCY_SYMBOL}`, 30000);
+  await broadcastAdminAction(`⚙️ Withdrawal Limits Updated\n\nAdmin: ${adminId}\nMin Withdrawal: ${minW} ${CURRENCY_SYMBOL}\nMax Withdrawal: ${maxW} ${CURRENCY_SYMBOL}`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// Set referral reward
+bot.onText(/\/setreferralreward\s+(\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const amt = parseFloat(match[1]);
+  
+  await db.setSetting('referralReward', amt);
+  
+  await sendAndAutoDelete(chatId, `✅ Referral reward updated: ${amt} ${CURRENCY_SYMBOL}`, 30000);
+  await broadcastAdminAction(`👥 Referral Reward Updated\n\nAdmin: ${adminId}\nNew Reward: ${amt} ${CURRENCY_SYMBOL}`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// Set daily bonus reward
+bot.onText(/\/setdailybonusreward\s+(\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) return;
+  
+  const amt = parseFloat(match[1]);
+  
+  await db.setSetting('bonusAmount', amt);
+  
+  await sendAndAutoDelete(chatId, `✅ Daily bonus reward updated: ${amt} ${CURRENCY_SYMBOL}`, 30000);
+  await broadcastAdminAction(`🎁 Daily Bonus Updated\n\nAdmin: ${adminId}\nNew Bonus: ${amt} ${CURRENCY_SYMBOL}`);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// ================= Log last message id per user per chat ================
+bot.on('message', (msg) => {
+  if (!msg.from || msg.from.is_bot) return;
+  global.userLatestMessage[msg.chat.id] = global.userLatestMessage[msg.chat.id] || {};
+  global.userLatestMessage[msg.chat.id][msg.from.id] = msg.message_id;
 });
 
 /* Final: Keep console log so you know the bot started */
