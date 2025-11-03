@@ -1522,7 +1522,8 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   
   info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
   info += `├ Messages Sent: ${user.message_count || 0}\n`;
-  info += `├ Activity Score: ${user.activity_score?.toFixed(2) || 0}\n`;
+  const activityScore = parseFloat(user.activity_score);
+  info += `├ Activity Score: ${!isNaN(activityScore) ? activityScore.toFixed(2) : 0}\n`;
   info += `├ Completed Tasks: ${completedTasks.length}\n`;
   const timeSinceLastSeen = Date.now() - user.last_seen;
   const hoursSinceLastSeen = timeSinceLastSeen / (1000 * 60 * 60);
