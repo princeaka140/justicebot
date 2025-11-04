@@ -47,6 +47,8 @@ async function initializeDatabase() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS command_count INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS button_click_count INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS last_decay_applied BIGINT DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS language_code TEXT;
 
       CREATE TABLE IF NOT EXISTS referrals (
         referrer_id BIGINT NOT NULL,
@@ -204,7 +206,7 @@ async function getUser(userId) {
   return result.rows[0] || null;
 }
 
-async function createUser(userId, username = '') {
+async function createUser(userId, username = '', countryCode = null, languageCode = null) {
   const now = Date.now();
   const today = new Date().toISOString().split('T')[0];
   const result = await pool.query(
@@ -212,14 +214,17 @@ async function createUser(userId, username = '') {
       id, username, balance, wallet, verified, registered_at, last_seen, 
       message_count, activity_score, last_bonus_claim, current_streak, 
       longest_streak, last_activity_date, engagement_tier, spam_score,
-      group_message_count, bot_message_count, command_count, button_click_count
+      group_message_count, bot_message_count, command_count, button_click_count,
+      country_code, language_code
     )
-     VALUES ($1, $2, 0, '', FALSE, $3, $3, 0, 0, 0, 0, 0, $4, 'Regular', 0, 0, 0, 0, 0)
+     VALUES ($1, $2, 0, '', FALSE, $3, $3, 0, 0, 0, 0, 0, $4, 'Regular', 0, 0, 0, 0, 0, $5, $6)
      ON CONFLICT (id) DO UPDATE SET
        username = EXCLUDED.username,
-       last_seen = EXCLUDED.last_seen
+       last_seen = EXCLUDED.last_seen,
+       country_code = COALESCE(users.country_code, EXCLUDED.country_code),
+       language_code = COALESCE(users.language_code, EXCLUDED.language_code)
      RETURNING *`,
-    [userId, username, now, today]
+    [userId, username, now, today, countryCode, languageCode]
   );
   return result.rows[0];
 }
@@ -247,15 +252,23 @@ async function updateUser(userId, updates) {
   return result.rows[0];
 }
 
-async function ensureUser(userId, username = null, updateActivity = false, activityContext = {}) {
+async function ensureUser(userId, username = null, updateActivity = false, activityContext = {}, countryCode = null, languageCode = null) {
   let user = await getUser(userId);
 
   if (!user) {
-    user = await createUser(userId, username);
+    user = await createUser(userId, username, countryCode, languageCode);
   } else {
     const updates = { last_seen: Date.now() };
     if (username && username !== user.username) {
       updates.username = username;
+    }
+    
+    // Update country and language if not set
+    if (countryCode && !user.country_code) {
+      updates.country_code = countryCode;
+    }
+    if (languageCode && !user.language_code) {
+      updates.language_code = languageCode;
     }
 
     if (updateActivity) {
@@ -620,6 +633,22 @@ async function getVerifiedUsers() {
 async function getTotalBalance() {
   const result = await pool.query('SELECT SUM(balance) as total FROM users');
   return parseFloat(result.rows[0].total) || 0;
+}
+
+/**
+ * Get country distribution statistics
+ */
+async function getCountryDistribution() {
+  const result = await pool.query(
+    `SELECT 
+      country_code,
+      COUNT(*) as count
+     FROM users
+     WHERE country_code IS NOT NULL
+     GROUP BY country_code
+     ORDER BY count DESC`
+  );
+  return result.rows;
 }
 
 /* ----------------------- Withdrawals ----------------------- */
@@ -1638,5 +1667,7 @@ module.exports = {
   runMaintenanceTasks,
   // Bot detection
   detectBotOrFakeUser,
+  // Country stats
+  getCountryDistribution,
   pool
 };
