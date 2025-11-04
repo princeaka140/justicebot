@@ -463,7 +463,14 @@ bot.on('message', async (m) => {
   const isAdminGroup = chatId === ADMIN_GROUP_ID;
   const chatType = m.chat.type || 'private';
   
-  // Log activity
+  // IMPORTANT: Ensure user exists FIRST before logging activity
+  try {
+    await db.ensureUser(uid, username, true, { chatType, chatId });
+  } catch (error) {
+    console.error('Error ensuring user:', error);
+  }
+  
+  // Log activity AFTER user is created
   try {
     const activityType = text?.startsWith('/') ? 'command' : 
                         m.photo ? 'photo' : 
@@ -480,13 +487,12 @@ bot.on('message', async (m) => {
     // Update command count if it's a command
     if (text?.startsWith('/')) {
       const user = await db.getUser(uid);
-      await db.updateUser(uid, {
-        command_count: (user.command_count || 0) + 1
-      });
+      if (user) {
+        await db.updateUser(uid, {
+          command_count: (user.command_count || 0) + 1
+        });
+      }
     }
-    
-    // Update user activity with context
-    await db.ensureUser(uid, username, true, { chatType, chatId });
     
     // Check for spam
     const spamCheck = await db.checkSpamBehavior(uid);
@@ -574,9 +580,6 @@ bot.on('message', async (m) => {
     }
     return; // important: if we were in intro flow, we handled the message
   }
-
-  // From here on handle normal user commands and flows
-  await db.ensureUser(uid, m.from.username || "", true, { chatType, chatId });
 
   // Disable menu buttons in admin group - only commands work
   if (isAdminGroup && text && !text.startsWith('/')) {
@@ -809,14 +812,24 @@ bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
   const data = query.data;
+  const username = query.from.username || '';
+  
+  // Ensure user exists first
+  try {
+    await db.ensureUser(userId, username);
+  } catch (error) {
+    console.error('Error ensuring user in callback:', error);
+  }
   
   // Track button clicks
   try {
     await db.logActivity(userId, 'button_click', { data, chatId }, chatId, query.message.chat.type);
     const user = await db.getUser(userId);
-    await db.updateUser(userId, {
-      button_click_count: (user.button_click_count || 0) + 1
-    });
+    if (user) {
+      await db.updateUser(userId, {
+        button_click_count: (user.button_click_count || 0) + 1
+      });
+    }
   } catch (error) {
     console.error('Error tracking button click:', error);
   }
@@ -2267,12 +2280,16 @@ bot.on('new_chat_members', async (msg) => {
     const userId = member.id;
     const username = member.username || '';
     
-    await db.ensureUser(userId, username);
-    await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
-    
-    // Auto-flag if no username
-    if (!username) {
-      await db.flagUserAsFake(userId, 'No username - joined group');
+    try {
+      await db.ensureUser(userId, username);
+      await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
+      
+      // Auto-flag if no username
+      if (!username) {
+        await db.flagUserAsFake(userId, 'No username - joined group');
+      }
+    } catch (error) {
+      console.error('Error tracking new member:', error);
     }
   }
 });
@@ -2289,10 +2306,16 @@ bot.on('left_chat_member', async (msg) => {
   
   const userId = member.id;
   
-  await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
-  
-  // Auto-flag as fake for joining and leaving
-  await db.flagUserAsFake(userId, 'Joined and left group');
+  try {
+    // Ensure user exists before logging
+    await db.ensureUser(userId, member.username || '');
+    await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
+    
+    // Auto-flag as fake for joining and leaving
+    await db.flagUserAsFake(userId, 'Joined and left group');
+  } catch (error) {
+    console.error('Error tracking member leaving:', error);
+  }
 });
 
 /* Final: Keep console log so you know the bot started */
