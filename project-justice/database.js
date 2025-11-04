@@ -28,31 +28,25 @@ async function initializeDatabase() {
         activity_score DECIMAL(10,4) DEFAULT 0,
         last_bonus_claim BIGINT DEFAULT 0,
         
-        -- Streak tracking
-        current_streak INTEGER DEFAULT 0,
-        longest_streak INTEGER DEFAULT 0,
-        last_activity_date DATE,
-        
-        -- Engagement tier
-        engagement_tier TEXT DEFAULT 'Regular',
-        tier_updated_at BIGINT,
-        
-        -- Spam detection
-        spam_score DECIMAL(10,4) DEFAULT 0,
-        last_spam_check BIGINT DEFAULT 0,
-        is_throttled BOOLEAN DEFAULT FALSE,
-        throttled_until BIGINT,
-        
-        -- Activity metrics
-        group_message_count INTEGER DEFAULT 0,
-        bot_message_count INTEGER DEFAULT 0,
-        command_count INTEGER DEFAULT 0,
-        button_click_count INTEGER DEFAULT 0,
-        last_decay_applied BIGINT DEFAULT 0,
-        
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+      
+      -- Add new columns if they don't exist (migration)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS longest_streak INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_date DATE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS engagement_tier TEXT DEFAULT 'Regular';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS tier_updated_at BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS spam_score DECIMAL(10,4) DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spam_check BIGINT DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_throttled BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS throttled_until BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS group_message_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_message_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS command_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS button_click_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_decay_applied BIGINT DEFAULT 0;
 
       CREATE TABLE IF NOT EXISTS referrals (
         referrer_id BIGINT NOT NULL,
@@ -137,19 +131,49 @@ async function initializeDatabase() {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
 
-      CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-      CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified);
-      CREATE INDEX IF NOT EXISTS idx_users_engagement_tier ON users(engagement_tier);
-      CREATE INDEX IF NOT EXISTS idx_users_last_activity_date ON users(last_activity_date);
-      CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
-      CREATE INDEX IF NOT EXISTS idx_task_submissions_user ON task_submissions(user_id);
-      CREATE INDEX IF NOT EXISTS idx_task_submissions_status ON task_submissions(status);
-      CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-      CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status);
-      CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklist(user_id);
-      CREATE INDEX IF NOT EXISTS idx_activity_log_user ON user_activity_log(user_id);
-      CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON user_activity_log(timestamp);
-      CREATE INDEX IF NOT EXISTS idx_activity_log_type ON user_activity_log(activity_type);
+      -- Create indexes (will skip if already exist)
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_username') THEN
+          CREATE INDEX idx_users_username ON users(username);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_verified') THEN
+          CREATE INDEX idx_users_verified ON users(verified);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_engagement_tier') THEN
+          CREATE INDEX idx_users_engagement_tier ON users(engagement_tier);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_last_activity_date') THEN
+          CREATE INDEX idx_users_last_activity_date ON users(last_activity_date);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_referrals_referrer') THEN
+          CREATE INDEX idx_referrals_referrer ON referrals(referrer_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_task_submissions_user') THEN
+          CREATE INDEX idx_task_submissions_user ON task_submissions(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_task_submissions_status') THEN
+          CREATE INDEX idx_task_submissions_status ON task_submissions(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_tasks_status') THEN
+          CREATE INDEX idx_tasks_status ON tasks(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_withdrawal_requests_status') THEN
+          CREATE INDEX idx_withdrawal_requests_status ON withdrawal_requests(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_blacklist_user') THEN
+          CREATE INDEX idx_blacklist_user ON blacklist(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_user') THEN
+          CREATE INDEX idx_activity_log_user ON user_activity_log(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_timestamp') THEN
+          CREATE INDEX idx_activity_log_timestamp ON user_activity_log(timestamp);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_type') THEN
+          CREATE INDEX idx_activity_log_type ON user_activity_log(activity_type);
+        END IF;
+      END $$;
     `);
 
     await client.query(`
