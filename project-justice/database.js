@@ -424,6 +424,20 @@ async function getLatestPendingSubmission(userId) {
   return result.rows[0] || null;
 }
 
+async function getPendingSubmissionsCount() {
+  const result = await pool.query(
+    `SELECT COUNT(*) as count FROM task_submissions WHERE status = 'pending'`
+  );
+  return parseInt(result.rows[0].count) || 0;
+}
+
+async function getAllPendingSubmissions() {
+  const result = await pool.query(
+    `SELECT * FROM task_submissions WHERE status = 'pending' ORDER BY submitted_at DESC`
+  );
+  return result.rows;
+}
+
 // Small helper to run transactional approval (updates submission, user balance, completed_tasks and counters)
 async function approveSubmissionAtomic(submissionId, reviewedBy) {
   const client = await pool.connect();
@@ -1669,5 +1683,8 @@ module.exports = {
   detectBotOrFakeUser,
   // Country stats
   getCountryDistribution,
+  // Pending submissions
+  getPendingSubmissionsCount,
+  getAllPendingSubmissions,
   pool
 };
