@@ -466,8 +466,9 @@ bot.on('message', async (m) => {
   
   // IMPORTANT: Ensure user exists FIRST before logging activity
   try {
-    // Note: Telegram doesn't provide country_code directly, we'll try to infer from language_code
-    await db.ensureUser(uid, username, true, { chatType, chatId }, null, languageCode);
+    // Infer country from language code
+    const countryCode = inferCountryFromLanguage(languageCode);
+    await db.ensureUser(uid, username, true, { chatType, chatId }, countryCode, languageCode);
   } catch (error) {
     console.error('Error ensuring user:', error);
   }
@@ -705,7 +706,8 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   console.log(`/start triggered by ${userId}. param: ${startParam || '<none>'}`);
 
   try {
-    await db.ensureUser(userId, username, false, {}, null, languageCode);
+    const countryCode = inferCountryFromLanguage(languageCode);
+    await db.ensureUser(userId, username, false, {}, countryCode, languageCode);
 
     if (startParam && startParam !== String(userId)) {
       const user = await db.getUser(userId);
@@ -820,7 +822,8 @@ bot.on('callback_query', async (query) => {
   
   // Ensure user exists first
   try {
-    await db.ensureUser(userId, username, false, {}, null, languageCode);
+    const countryCode = inferCountryFromLanguage(languageCode);
+    await db.ensureUser(userId, username, false, {}, countryCode, languageCode);
   } catch (error) {
     console.error('Error ensuring user in callback:', error);
   }
@@ -1154,6 +1157,32 @@ function getCountryFlag(countryCode) {
   return String.fromCodePoint(...codePoints);
 }
 
+// Helper function to infer country from language code
+function inferCountryFromLanguage(languageCode) {
+  if (!languageCode) return null;
+  
+  const languageToCountry = {
+    'en': 'US', 'es': 'ES', 'fr': 'FR', 'de': 'DE', 'it': 'IT',
+    'pt': 'BR', 'ru': 'RU', 'ja': 'JP', 'ko': 'KR', 'zh': 'CN',
+    'ar': 'SA', 'hi': 'IN', 'bn': 'BD', 'pa': 'IN', 'te': 'IN',
+    'mr': 'IN', 'ta': 'IN', 'ur': 'PK', 'tr': 'TR', 'vi': 'VN',
+    'th': 'TH', 'pl': 'PL', 'uk': 'UA', 'nl': 'NL', 'sv': 'SE',
+    'no': 'NO', 'da': 'DK', 'fi': 'FI', 'el': 'GR', 'cs': 'CZ',
+    'hu': 'HU', 'ro': 'RO', 'id': 'ID', 'ms': 'MY', 'fa': 'IR',
+    'he': 'IL', 'af': 'ZA', 'sq': 'AL', 'am': 'ET', 'hy': 'AM',
+    'az': 'AZ', 'eu': 'ES', 'be': 'BY', 'bs': 'BA', 'bg': 'BG',
+    'ca': 'ES', 'hr': 'HR', 'et': 'EE', 'tl': 'PH', 'ka': 'GE',
+    'gu': 'IN', 'ha': 'NG', 'is': 'IS', 'ig': 'NG', 'kk': 'KZ',
+    'km': 'KH', 'kn': 'IN', 'ky': 'KG', 'lo': 'LA', 'lv': 'LV',
+    'lt': 'LT', 'mk': 'MK', 'ml': 'IN', 'mn': 'MN', 'my': 'MM',
+    'ne': 'NP', 'or': 'IN', 'ps': 'AF', 'si': 'LK', 'sk': 'SK',
+    'sl': 'SI', 'so': 'SO', 'sr': 'RS', 'sw': 'KE', 'tg': 'TJ',
+    'uz': 'UZ', 'yo': 'NG', 'zu': 'ZA'
+  };
+  
+  return languageToCountry[languageCode.toLowerCase()] || null;
+}
+
 async function finishTaskSubmit(userId, chatId) {
   const pending = pendingTasks[userId];
   if (!pending) {
@@ -1172,18 +1201,19 @@ const task = await db.getTaskById(pending.taskId);
 const taskDescription = task?.description || "(no task description)";
 const userDescription = pending.text && pending.text.trim() ? pending.text.trim() : "(no user comment)";
 
-const caption = `📝 <b>New Task Submission</b>
+const caption = `📝 New Task Submission
+
 User: ${userIdentifier}
-Task: <b>${pending.taskTitle || 'Unknown'}</b>
+Task: ${pending.taskTitle || 'Unknown'}
 Reward: ${pending.taskReward || 0} ${CURRENCY_SYMBOL}
 
-<b>Task Description:</b>
+Task Description:
 ${taskDescription}
 
-<b>User Comment:</b>
+User Comment:
 ${userDescription}
 
-<b>Images:</b> ${pending.files.length}`;
+Images: ${pending.files.length}`;
 
   const submission = await db.createTaskSubmission(
     userId,
@@ -2317,7 +2347,8 @@ bot.on('new_chat_members', async (msg) => {
     const languageCode = member.language_code || null;
     
     try {
-      await db.ensureUser(userId, username, false, {}, null, languageCode);
+      const countryCode = inferCountryFromLanguage(languageCode);
+      await db.ensureUser(userId, username, false, {}, countryCode, languageCode);
       await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
       
       // Auto-flag if no username
@@ -2345,7 +2376,8 @@ bot.on('left_chat_member', async (msg) => {
   
   try {
     // Ensure user exists before logging
-    await db.ensureUser(userId, member.username || '', false, {}, null, languageCode);
+    const countryCode = inferCountryFromLanguage(languageCode);
+    await db.ensureUser(userId, member.username || '', false, {}, countryCode, languageCode);
     await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
     
     // Auto-flag as fake for joining and leaving
