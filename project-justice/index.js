@@ -106,6 +106,32 @@ async function initializeBotDatabase() {
   try {
     await db.initializeDatabase();
     console.log('✅ Bot database initialized successfully');
+    
+    // Start automatic maintenance tasks every 6 hours
+    setInterval(async () => {
+      console.log('🔄 Running scheduled maintenance tasks...');
+      try {
+        await db.runMaintenanceTasks();
+        console.log('✅ Scheduled maintenance completed');
+      } catch (error) {
+        console.error('❌ Maintenance task error:', error);
+      }
+    }, 6 * 60 * 60 * 1000); // 6 hours
+    
+    // Start automatic tracking update every 10 minutes
+    setInterval(async () => {
+      console.log('🔄 Running tracking updates...');
+      try {
+        const allUsers = await db.getAllUsers();
+        for (const user of allUsers) {
+          await db.updateEngagementTier(user.id);
+        }
+        console.log('✅ Tracking updates completed');
+      } catch (error) {
+        console.error('❌ Tracking update error:', error);
+      }
+    }, 10 * 60 * 1000); // 10 minutes
+    
   } catch (error) {
     console.error('❌ Bot database initialization failed:', error);
     process.exit(1);
@@ -425,16 +451,59 @@ bot.onText(/\/cancelintro/, async (msg) => {
   }
 });
 
-/* ---------- Single 'message' handler:
-   - logs incoming file_ids
-   - handles /introvideo admin upload flow
-   - then handles main user menu flows, pendingTasks, awaitingWallet, etc.
-*/
+/* ---------- Activity Tracking Middleware ---------- */
 bot.on('message', async (m) => {
   if (!m.from || m.from.is_bot) return;
   const uid = m.from.id;
   const chatId = m.chat.id;
   const text = m.text;
+  const username = m.from.username || '';
+  
+  // Track all activity in admin group and bot
+  const isAdminGroup = chatId === ADMIN_GROUP_ID;
+  const chatType = m.chat.type || 'private';
+  
+  // Log activity
+  try {
+    const activityType = text?.startsWith('/') ? 'command' : 
+                        m.photo ? 'photo' : 
+                        m.video ? 'video' : 
+                        m.document ? 'document' : 'message';
+    
+    await db.logActivity(uid, activityType, {
+      chatId,
+      chatType,
+      text: text?.substring(0, 100),
+      hasMedia: !!(m.photo || m.video || m.document)
+    }, chatId, chatType);
+    
+    // Update command count if it's a command
+    if (text?.startsWith('/')) {
+      const user = await db.getUser(uid);
+      await db.updateUser(uid, {
+        command_count: (user.command_count || 0) + 1
+      });
+    }
+    
+    // Update user activity with context
+    await db.ensureUser(uid, username, true, { chatType, chatId });
+    
+    // Check for spam
+    const spamCheck = await db.checkSpamBehavior(uid);
+    if (spamCheck.isSpamming) {
+      await bot.sendMessage(chatId, '⚠️ Slow down! You are sending messages too quickly. Please wait a moment.');
+      return;
+    }
+    
+    // Check if throttled
+    const isThrottled = await db.isUserThrottled(uid);
+    if (isThrottled) {
+      return; // Silently ignore throttled users
+    }
+    
+  } catch (error) {
+    console.error('Activity tracking error:', error);
+  }
 
   // Debug logging for incoming update
   console.log(`Incoming message from ${uid} in chat ${chatId} - text: ${text ? text.substring(0,80) : '<no text>'}`);
@@ -507,7 +576,18 @@ bot.on('message', async (m) => {
   }
 
   // From here on handle normal user commands and flows
-  await db.ensureUser(uid, m.from.username || "", true);
+  await db.ensureUser(uid, m.from.username || "", true, { chatType, chatId });
+
+  // Disable menu buttons in admin group - only commands work
+  if (isAdminGroup && text && !text.startsWith('/')) {
+    // Check if it's a menu button
+    const menuButtons = ["➡️ Continue", "🎯 Task", "🎁 Bonus", "💼 Trade", "💳 Set Wallet", 
+                        "👥 Referral", "💰 Balance", "💸 Withdrawal", "ℹ️ About Us", "💬 Support", "📊 Stats"];
+    if (menuButtons.includes(text)) {
+      await bot.sendMessage(chatId, '⚠️ Menu buttons are disabled in this group. Please use commands instead.');
+      return;
+    }
+  }
 
   // If the message is a reply-triggering UI button (➡️ Continue)
   if (text === "➡️ Continue") {
@@ -729,6 +809,17 @@ bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
   const data = query.data;
+  
+  // Track button clicks
+  try {
+    await db.logActivity(userId, 'button_click', { data, chatId }, chatId, query.message.chat.type);
+    const user = await db.getUser(userId);
+    await db.updateUser(userId, {
+      button_click_count: (user.button_click_count || 0) + 1
+    });
+  } catch (error) {
+    console.error('Error tracking button click:', error);
+  }
 
   if (data === "verify_now") {
     const missing = [];
@@ -868,6 +959,12 @@ bot.on('callback_query', async (query) => {
 /* (Below: verbatim implementations from your original working code) */
 
 async function showMenu(chatId) {
+  // Don't show menu in admin group
+  if (chatId === ADMIN_GROUP_ID) {
+    await bot.sendMessage(chatId, "🏠 Use commands to interact with the bot in this group.");
+    return;
+  }
+  
   const keyboard = {
     keyboard: [
       ["🎯 Task", "🎁 Bonus"],
@@ -1503,6 +1600,8 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   const refAnalysis = await db.analyzeReferralPattern(targetId);
   const withdrawalStats = await db.getUserWithdrawalStats(targetId);
   const referralDetails = await db.getDetailedReferralAnalysis(targetId);
+  const referrerInfo = await db.getReferrerInfo(targetId);
+  const botDetection = await db.detectBotOrFakeUser(targetId);
 
   const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
   const totalReferralEarnings = refAnalysis.realRefs * referralReward;
@@ -1513,6 +1612,9 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   info += `<b>━━━━━ Basic Info ━━━━━</b>\n`;
   info += `├ ID: <code>${user.id}</code>\n`;
   info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
+  if (referrerInfo) {
+    info += `├ Invited By: ${referrerInfo.username ? '@' + referrerInfo.username : referrerInfo.id}\n`;
+  }
 
   const balance = parseFloat(user.balance) || 0;
   info += `├ Balance: <b>${balance.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
@@ -1525,12 +1627,19 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   // ━━━━━ ACTIVITY STATS ━━━━━
   info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
   info += `├ Messages Sent: ${user.message_count || 0}\n`;
+  info += `├ Group Messages: ${user.group_message_count || 0}\n`;
+  info += `├ Bot Messages: ${user.bot_message_count || 0}\n`;
+  info += `├ Commands Used: ${user.command_count || 0}\n`;
+  info += `├ Button Clicks: ${user.button_click_count || 0}\n`;
 
   const activityScore = parseFloat(user.activity_score);
   info += `├ Activity Score: ${
     !isNaN(activityScore) ? activityScore.toFixed(2) : '0.00'
   }\n`;
   info += `├ Completed Tasks: ${completedTasks?.length || 0}\n`;
+  info += `├ Current Streak: ${user.current_streak || 0} days 🔥\n`;
+  info += `├ Longest Streak: ${user.longest_streak || 0} days 🏆\n`;
+  info += `├ Engagement Tier: ${user.engagement_tier || 'Regular'}\n`;
 
   let lastSeenStr = 'N/A';
   if (user.last_seen) {
@@ -1544,6 +1653,19 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
         : `${Math.floor(hoursSinceLastSeen / 24)}d ago`;
   }
   info += `└ Last Seen: ${lastSeenStr}\n\n`;
+  
+  // ━━━━━ BOT/FAKE DETECTION ━━━━━
+  info += `<b>━━━━━ Detection Analysis ━━━━━</b>\n`;
+  info += `├ Classification: ${botDetection.classification}\n`;
+  info += `├ Bot Score: ${botDetection.botScore}/100\n`;
+  info += `├ Fake Score: ${botDetection.fakeScore}/100\n`;
+  info += `├ Confidence: ${botDetection.confidence}%\n`;
+  info += `├ Spam Score: ${user.spam_score || 0}\n`;
+  info += `├ Is Throttled: ${user.is_throttled ? 'Yes ⚠️' : 'No ✅'}\n`;
+  if (botDetection.reasons.length > 0) {
+    info += `└ Flags: ${botDetection.reasons.slice(0, 3).join(', ')}\n`;
+  }
+  info += `\n`;
 
   // ━━━━━ WITHDRAWAL STATS ━━━━━
   info += `<b>━━━━━ Withdrawal Stats ━━━━━</b>\n`;
@@ -1863,5 +1985,319 @@ bot.on('message', (msg) => {
   global.userLatestMessage[msg.chat.id][msg.from.id] = msg.message_id;
 });
 
+/* ==================== NEW ADMIN COMMANDS ==================== */
+
+// /activitylog - View user activity history
+bot.onText(/\/activitylog\s+(@?\w+|\d+)(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const limit = match[2] ? parseInt(match[2]) : 20;
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const logs = await db.getUserActivityLogs(targetId, { limit });
+  const userIdentifier = await getUserIdentifier(targetId);
+  
+  if (logs.length === 0) {
+    await sendAndAutoDelete(chatId, `📋 No activity logs found for ${userIdentifier}`, 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  let text = `📋 <b>Activity Log for ${userIdentifier}</b>\n\n`;
+  logs.forEach((log, i) => {
+    const date = new Date(log.timestamp).toLocaleString();
+    text += `${i + 1}. ${log.activity_type} - ${date}\n`;
+    if (log.chat_type) text += `   Chat: ${log.chat_type}\n`;
+  });
+  
+  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /tiers - Show engagement distribution
+bot.onText(/\/tiers/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const distribution = await db.getTierDistribution();
+  
+  let text = `🏆 <b>Engagement Tier Distribution</b>\n\n`;
+  const tierEmojis = {
+    'Elite': '👑',
+    'Active': '⭐',
+    'Regular': '✅',
+    'Dormant': '😴',
+    'Ghost': '👻'
+  };
+  
+  distribution.forEach(tier => {
+    const emoji = tierEmojis[tier.engagement_tier] || '📊';
+    text += `${emoji} ${tier.engagement_tier}: ${tier.count} users\n`;
+  });
+  
+  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /updatetier - Recalculate user tier
+bot.onText(/\/updatetier\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const result = await db.updateEngagementTier(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  
+  await sendAndAutoDelete(chatId, `✅ Tier updated for ${userIdentifier}\nNew Tier: ${result.tier}\nScore: ${result.tierScore.toFixed(2)}`, 30000);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /streak - View streak info
+bot.onText(/\/streak\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const user = await db.getUser(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  
+  let text = `🔥 <b>Streak Info for ${userIdentifier}</b>\n\n`;
+  text += `Current Streak: ${user.current_streak || 0} days\n`;
+  text += `Longest Streak: ${user.longest_streak || 0} days\n`;
+  text += `Last Activity: ${user.last_activity_date || 'Never'}\n`;
+  
+  await sendAndAutoDelete(chatId, text, 30000, { parse_mode: 'HTML' });
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /spamcheck - Check spam status
+bot.onText(/\/spamcheck\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const spamCheck = await db.checkSpamBehavior(targetId);
+  const user = await db.getUser(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  
+  let text = `🚨 <b>Spam Check for ${userIdentifier}</b>\n\n`;
+  text += `Is Spamming: ${spamCheck.isSpamming ? '⚠️ Yes' : '✅ No'}\n`;
+  text += `Spam Score: ${spamCheck.spamScore.toFixed(2)}\n`;
+  text += `Messages (1 min): ${spamCheck.messagesLastMinute}\n`;
+  text += `Messages (5 min): ${spamCheck.messagesLastFiveMin}\n`;
+  text += `Is Throttled: ${user.is_throttled ? '⚠️ Yes' : '✅ No'}\n`;
+  
+  if (user.throttled_until) {
+    const timeLeft = user.throttled_until - Date.now();
+    if (timeLeft > 0) {
+      const minutesLeft = Math.floor(timeLeft / 60000);
+      text += `Throttled Until: ${minutesLeft} minutes\n`;
+    }
+  }
+  
+  await sendAndAutoDelete(chatId, text, 30000, { parse_mode: 'HTML' });
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /unthrottle - Remove throttle
+bot.onText(/\/unthrottle\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  await db.updateUser(targetId, {
+    is_throttled: false,
+    throttled_until: null,
+    spam_score: 0
+  });
+  
+  const userIdentifier = await getUserIdentifier(targetId);
+  await sendAndAutoDelete(chatId, `✅ Throttle removed for ${userIdentifier}`, 30000);
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /detectbot - Run bot detection
+bot.onText(/\/detectbot\s+(@?\w+|\d+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  const input = match[1].trim();
+  const targetId = await resolveUserInput(input);
+  
+  if (!targetId) {
+    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
+    deleteMessageLater(chatId, msg.message_id, 30000);
+    return;
+  }
+  
+  const detection = await db.detectBotOrFakeUser(targetId);
+  const userIdentifier = await getUserIdentifier(targetId);
+  
+  let text = `🤖 <b>Bot Detection for ${userIdentifier}</b>\n\n`;
+  text += `Classification: ${detection.classification}\n`;
+  text += `Is Bot: ${detection.isBot ? '⚠️ Yes' : '✅ No'}\n`;
+  text += `Is Fake: ${detection.isFake ? '🚫 Yes' : '✅ No'}\n`;
+  text += `Bot Score: ${detection.botScore}/100\n`;
+  text += `Fake Score: ${detection.fakeScore}/100\n`;
+  text += `Confidence: ${detection.confidence}%\n\n`;
+  text += `<b>Reasons:</b>\n`;
+  detection.reasons.forEach((reason, i) => {
+    text += `${i + 1}. ${reason}\n`;
+  });
+  
+  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+// /maintenance - Run all maintenance tasks
+bot.onText(/\/maintenance/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = msg.from.id;
+  
+  if (!isAdminId(adminId)) {
+    await sendEphemeralWarning(chatId, "⛔ Admin only!");
+    return;
+  }
+  
+  await sendAndAutoDelete(chatId, '🔄 Running maintenance tasks...', 5000);
+  
+  try {
+    const result = await db.runMaintenanceTasks();
+    
+    let text = `✅ <b>Maintenance Complete</b>\n\n`;
+    text += `Idle Decay: ${result.idleDecay.decayedCount} users\n`;
+    text += `Referral Decay: ${result.referralDecay.processedCount} users\n`;
+    text += `Tiers Updated: ${result.tiersUpdated} users\n`;
+    
+    await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
+  } catch (error) {
+    await sendAndAutoDelete(chatId, `❌ Maintenance failed: ${error.message}`, 30000);
+  }
+  
+  deleteMessageLater(chatId, msg.message_id, 30000);
+});
+
+/* ==================== GROUP MEMBER TRACKING ==================== */
+
+// Track new members joining
+bot.on('new_chat_members', async (msg) => {
+  const chatId = msg.chat.id;
+  
+  // Only track in admin group
+  if (chatId !== ADMIN_GROUP_ID) return;
+  
+  for (const member of msg.new_chat_members) {
+    if (member.is_bot) continue;
+    
+    const userId = member.id;
+    const username = member.username || '';
+    
+    await db.ensureUser(userId, username);
+    await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
+    
+    // Auto-flag if no username
+    if (!username) {
+      await db.flagUserAsFake(userId, 'No username - joined group');
+    }
+  }
+});
+
+// Track members leaving
+bot.on('left_chat_member', async (msg) => {
+  const chatId = msg.chat.id;
+  
+  // Only track in admin group
+  if (chatId !== ADMIN_GROUP_ID) return;
+  
+  const member = msg.left_chat_member;
+  if (member.is_bot) return;
+  
+  const userId = member.id;
+  
+  await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
+  
+  // Auto-flag as fake for joining and leaving
+  await db.flagUserAsFake(userId, 'Joined and left group');
+});
+
 /* Final: Keep console log so you know the bot started */
 console.log("Bot webhook server is running and handlers are registered.");
+console.log("✅ Activity tracking enabled");
+console.log("✅ Auto-maintenance scheduled (every 6 hours)");
+console.log("✅ Auto-tracking updates scheduled (every 10 minutes)");
+console.log("✅ Group member tracking enabled");
