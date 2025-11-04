@@ -1516,7 +1516,6 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
 
   const balance = parseFloat(user.balance) || 0;
   info += `├ Balance: <b>${balance.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
-
   info += `├ Wallet: <code>${user.wallet || '(not set)'}</code>\n`;
   info += `├ Verified: ${user.verified ? '✅ Yes' : '❌ No'}\n`;
   info += `└ Registered: ${
@@ -1531,7 +1530,6 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   info += `├ Activity Score: ${
     !isNaN(activityScore) ? activityScore.toFixed(2) : '0.00'
   }\n`;
-
   info += `├ Completed Tasks: ${completedTasks?.length || 0}\n`;
 
   let lastSeenStr = 'N/A';
@@ -1564,56 +1562,28 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   info += `├ Quality: ${parseFloat(refAnalysis?.percentage) || 0}%\n`;
   info += `└ Referral Earnings: <b>${parseFloat(totalReferralEarnings) || 0} ${CURRENCY_SYMBOL}</b>\n\n`;
 
-  // ━━━━━ DETAILED REFERRALS ━━━━━
+  // ━━━━━ MINI REFERRAL OVERVIEW ━━━━━
   if (referralDetails.length > 0) {
-    info += `<b>━━━━━ 📋 Detailed Referral List ━━━━━</b>\n\n`;
+    info += `<b>━━━━━ 👥 Top Referrals ━━━━━</b>\n`;
 
-    for (let i = 0; i < referralDetails.length; i++) {
-      const ref = referralDetails[i];
-      const num = i + 1;
+    // Sort by score descending and show top 3
+    const topRefs = referralDetails
+      .sort((a, b) => (b.totalScore || 0) - (a.totalScore || 0))
+      .slice(0, 3);
 
-      const refActivity = parseFloat(ref.activityScore);
-      const refBalance = parseFloat(ref.balance) || 0;
-      const refTotalScore = parseFloat(ref.totalScore) || 0;
+    topRefs.forEach((ref, i) => {
+      const stars = '⭐'.repeat(Math.min(5, Math.round(ref.totalScore / 2)));
+      info += `${i + 1}. ${ref.username ? '@' + ref.username : ref.userId} — ${stars} (${ref.totalScore || 0}/13)\n`;
+    });
 
-      info += `<b>${num}. ${ref.username ? '@' + ref.username : 'ID: ' + ref.userId}</b>\n`;
-      info += `   ├ Status: ${ref.statusEmoji} <b>${ref.classification}</b>\n`;
-      info += `   ├ Score: ${
-        ref.scoreStars || '⭐'.repeat(Math.min(5, Math.round(refTotalScore / 2)))
-      } (${refTotalScore}/13 points)\n`;
-      info += `   ├ Balance: ${refBalance.toFixed(2)} ${CURRENCY_SYMBOL}\n`;
-      info += `   ├ Wallet: ${
-        ref.wallet
-          ? '<code>' + ref.wallet.substring(0, 20) + '...</code>'
-          : '(not set)'
-      }\n`;
-      info += `   ├ Messages: ${ref.messageCount || 0} | Tasks: ${
-        ref.completedTasks || 0
-      }\n`;
-      info += `   ├ Activity: ${
-        !isNaN(refActivity) ? refActivity.toFixed(2) : '0.00'
-      } | Age: ${ref.accountAge || 'N/A'}\n`;
-      info += `   ├ Verified: ${ref.verified ? '✅' : '❌'} | Has Wallet: ${
-        ref.hasWallet ? '✅' : '❌'
-      }\n`;
-      info += `   ├ Referrals: ${ref.referralCount || 0}\n`;
-      info += `   ├ Withdrawn: ${
-        ref.totalWithdrawn || 0
-      } ${CURRENCY_SYMBOL} | Pending: ${ref.pendingWithdrawals || 0}\n`;
-      info += `   ├ Last Seen: ${ref.lastSeen || 'N/A'}\n`;
-      info += `   └ Registered: ${ref.registeredAt || 'N/A'}\n\n`;
-    }
-
+    // Classification summary
     const realCount = referralDetails.filter(r => r.classification === 'Real User').length;
     const suspiciousCount = referralDetails.filter(r => r.classification === 'Suspicious').length;
     const botCount = referralDetails.filter(r => r.classification === 'Likely Bot').length;
     const fakeCount = referralDetails.filter(r => r.classification === 'Fake').length;
 
-    info += `<b>━━━━━ 📊 Classification Summary ━━━━━</b>\n`;
-    info += `✅ Real Users: ${realCount}\n`;
-    info += `⚠️ Suspicious: ${suspiciousCount}\n`;
-    info += `🤖 Likely Bots: ${botCount}\n`;
-    info += `🚫 Fake: ${fakeCount}\n\n`;
+    info += `\n<b>━━━━━ 📊 Classification Summary ━━━━━</b>\n`;
+    info += `✅ Real: ${realCount} | ⚠️ Suspicious: ${suspiciousCount} | 🤖 Bots: ${botCount} | 🚫 Fake: ${fakeCount}\n\n`;
   } else {
     info += `<i>No referrals yet.</i>\n\n`;
   }
