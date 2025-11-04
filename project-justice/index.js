@@ -458,6 +458,7 @@ bot.on('message', async (m) => {
   const chatId = m.chat.id;
   const text = m.text;
   const username = m.from.username || '';
+  const languageCode = m.from.language_code || null;
   
   // Track all activity in admin group and bot
   const isAdminGroup = chatId === ADMIN_GROUP_ID;
@@ -465,7 +466,8 @@ bot.on('message', async (m) => {
   
   // IMPORTANT: Ensure user exists FIRST before logging activity
   try {
-    await db.ensureUser(uid, username, true, { chatType, chatId });
+    // Note: Telegram doesn't provide country_code directly, we'll try to infer from language_code
+    await db.ensureUser(uid, username, true, { chatType, chatId }, null, languageCode);
   } catch (error) {
     console.error('Error ensuring user:', error);
   }
@@ -697,12 +699,13 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const username = msg.from.username || "";
+  const languageCode = msg.from.language_code || null;
   const startParam = match[1];
 
   console.log(`/start triggered by ${userId}. param: ${startParam || '<none>'}`);
 
   try {
-    await db.ensureUser(userId, username);
+    await db.ensureUser(userId, username, false, {}, null, languageCode);
 
     if (startParam && startParam !== String(userId)) {
       const user = await db.getUser(userId);
@@ -813,10 +816,11 @@ bot.on('callback_query', async (query) => {
   const userId = query.from.id;
   const data = query.data;
   const username = query.from.username || '';
+  const languageCode = query.from.language_code || null;
   
   // Ensure user exists first
   try {
-    await db.ensureUser(userId, username);
+    await db.ensureUser(userId, username, false, {}, null, languageCode);
   } catch (error) {
     console.error('Error ensuring user in callback:', error);
   }
@@ -1085,6 +1089,7 @@ async function handleStats(chatId) {
   const offlineUsers = totalUsers - onlineUsers;
 
   const totalBalance = await db.getTotalBalance();
+  const countryStats = await db.getCountryDistribution();
   
   // Note: systemHealth referenced here in original code; keep compatibility
   // Analyze all users for system health
@@ -1114,7 +1119,7 @@ async function handleStats(chatId) {
     score: healthScore
   };
 
-  const statsText = `📊 System Statistics\n\n` +
+  let statsText = `📊 System Statistics\n\n` +
     `Total Users: ${totalUsers}\n` +
     `Real Users: ${systemHealth.realUsers}\n` +
     `Suspicious Users: ${systemHealth.suspiciousUsers}\n` +
@@ -1123,7 +1128,30 @@ async function handleStats(chatId) {
     `Total Balance: ${totalBalance} ${CURRENCY_SYMBOL}\n\n` +
     `Progress Score: ${systemHealth.score}`;
   
+  // Add country distribution
+  if (countryStats.length > 0) {
+    statsText += `\n\n🌍 Countries Registered:\n`;
+    const topCountries = countryStats.slice(0, 10);
+    topCountries.forEach((country, index) => {
+      const flag = getCountryFlag(country.country_code);
+      statsText += `${index + 1}. ${flag} ${country.country_code || 'Unknown'}: ${country.count} users\n`;
+    });
+    if (countryStats.length > 10) {
+      statsText += `... and ${countryStats.length - 10} more countries`;
+    }
+  }
+  
   await bot.sendMessage(chatId, statsText);
+}
+
+// Helper function to get country flag emoji
+function getCountryFlag(countryCode) {
+  if (!countryCode || countryCode.length !== 2) return '🌐';
+  const codePoints = countryCode
+    .toUpperCase()
+    .split('')
+    .map(char => 127397 + char.charCodeAt());
+  return String.fromCodePoint(...codePoints);
 }
 
 async function finishTaskSubmit(userId, chatId) {
@@ -1627,6 +1655,13 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
   if (referrerInfo) {
     info += `├ Invited By: ${referrerInfo.username ? '@' + referrerInfo.username : referrerInfo.id}\n`;
+  }
+  if (user.country_code) {
+    const flag = getCountryFlag(user.country_code);
+    info += `├ Country: ${flag} ${user.country_code}\n`;
+  }
+  if (user.language_code) {
+    info += `├ Language: ${user.language_code}\n`;
   }
 
   const balance = parseFloat(user.balance) || 0;
@@ -2279,9 +2314,10 @@ bot.on('new_chat_members', async (msg) => {
     
     const userId = member.id;
     const username = member.username || '';
+    const languageCode = member.language_code || null;
     
     try {
-      await db.ensureUser(userId, username);
+      await db.ensureUser(userId, username, false, {}, null, languageCode);
       await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
       
       // Auto-flag if no username
@@ -2305,10 +2341,11 @@ bot.on('left_chat_member', async (msg) => {
   if (member.is_bot) return;
   
   const userId = member.id;
+  const languageCode = member.language_code || null;
   
   try {
     // Ensure user exists before logging
-    await db.ensureUser(userId, member.username || '');
+    await db.ensureUser(userId, member.username || '', false, {}, null, languageCode);
     await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
     
     // Auto-flag as fake for joining and leaving
