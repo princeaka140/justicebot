@@ -27,6 +27,29 @@ async function initializeDatabase() {
         message_count INTEGER DEFAULT 0,
         activity_score DECIMAL(10,4) DEFAULT 0,
         last_bonus_claim BIGINT DEFAULT 0,
+        
+        -- Streak tracking
+        current_streak INTEGER DEFAULT 0,
+        longest_streak INTEGER DEFAULT 0,
+        last_activity_date DATE,
+        
+        -- Engagement tier
+        engagement_tier TEXT DEFAULT 'Regular',
+        tier_updated_at BIGINT,
+        
+        -- Spam detection
+        spam_score DECIMAL(10,4) DEFAULT 0,
+        last_spam_check BIGINT DEFAULT 0,
+        is_throttled BOOLEAN DEFAULT FALSE,
+        throttled_until BIGINT,
+        
+        -- Activity metrics
+        group_message_count INTEGER DEFAULT 0,
+        bot_message_count INTEGER DEFAULT 0,
+        command_count INTEGER DEFAULT 0,
+        button_click_count INTEGER DEFAULT 0,
+        last_decay_applied BIGINT DEFAULT 0,
+        
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -102,14 +125,31 @@ async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS user_activity_log (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        activity_type TEXT NOT NULL,
+        activity_data JSONB DEFAULT '{}',
+        chat_id BIGINT,
+        chat_type TEXT,
+        timestamp BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
       CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified);
+      CREATE INDEX IF NOT EXISTS idx_users_engagement_tier ON users(engagement_tier);
+      CREATE INDEX IF NOT EXISTS idx_users_last_activity_date ON users(last_activity_date);
       CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
       CREATE INDEX IF NOT EXISTS idx_task_submissions_user ON task_submissions(user_id);
       CREATE INDEX IF NOT EXISTS idx_task_submissions_status ON task_submissions(status);
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status);
       CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklist(user_id);
+      CREATE INDEX IF NOT EXISTS idx_activity_log_user ON user_activity_log(user_id);
+      CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON user_activity_log(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_activity_log_type ON user_activity_log(activity_type);
     `);
 
     await client.query(`
@@ -142,14 +182,20 @@ async function getUser(userId) {
 
 async function createUser(userId, username = '') {
   const now = Date.now();
+  const today = new Date().toISOString().split('T')[0];
   const result = await pool.query(
-    `INSERT INTO users (id, username, balance, wallet, verified, registered_at, last_seen, message_count, activity_score, last_bonus_claim)
-     VALUES ($1, $2, 0, '', FALSE, $3, $3, 0, 0, 0)
+    `INSERT INTO users (
+      id, username, balance, wallet, verified, registered_at, last_seen, 
+      message_count, activity_score, last_bonus_claim, current_streak, 
+      longest_streak, last_activity_date, engagement_tier, spam_score,
+      group_message_count, bot_message_count, command_count, button_click_count
+    )
+     VALUES ($1, $2, 0, '', FALSE, $3, $3, 0, 0, 0, 0, 0, $4, 'Regular', 0, 0, 0, 0, 0)
      ON CONFLICT (id) DO UPDATE SET
        username = EXCLUDED.username,
        last_seen = EXCLUDED.last_seen
      RETURNING *`,
-    [userId, username, now]
+    [userId, username, now, today]
   );
   return result.rows[0];
 }
@@ -177,7 +223,7 @@ async function updateUser(userId, updates) {
   return result.rows[0];
 }
 
-async function ensureUser(userId, username = null, updateActivity = false) {
+async function ensureUser(userId, username = null, updateActivity = false, activityContext = {}) {
   let user = await getUser(userId);
 
   if (!user) {
@@ -189,7 +235,42 @@ async function ensureUser(userId, username = null, updateActivity = false) {
     }
 
     if (updateActivity) {
+      // Update streak
+      const today = new Date().toISOString().split('T')[0];
+      const lastActivityDate = user.last_activity_date;
+      
+      if (lastActivityDate) {
+        const lastDate = new Date(lastActivityDate);
+        const todayDate = new Date(today);
+        const daysDiff = Math.floor((todayDate - lastDate) / (1000 * 60 * 60 * 24));
+        
+        if (daysDiff === 1) {
+          // Consecutive day
+          updates.current_streak = (user.current_streak || 0) + 1;
+          updates.longest_streak = Math.max(updates.current_streak, user.longest_streak || 0);
+        } else if (daysDiff > 1) {
+          // Streak broken
+          updates.current_streak = 1;
+        }
+        // Same day, no change to streak
+      } else {
+        updates.current_streak = 1;
+        updates.longest_streak = 1;
+      }
+      
+      updates.last_activity_date = today;
+      
+      // Update message counts based on context
+      const isGroup = activityContext.chatType === 'group' || activityContext.chatType === 'supergroup';
+      if (isGroup) {
+        updates.group_message_count = (user.group_message_count || 0) + 1;
+      } else {
+        updates.bot_message_count = (user.bot_message_count || 0) + 1;
+      }
+      
       updates.message_count = (user.message_count || 0) + 1;
+      
+      // Update activity score
       const hoursSinceRegistration = (Date.now() - user.registered_at) / (1000 * 60 * 60);
       if (hoursSinceRegistration > 0) {
         updates.activity_score = updates.message_count / Math.max(hoursSinceRegistration, 0.01);
@@ -836,6 +917,476 @@ async function getUserWithdrawalStats(userId) {
   };
 }
 
+/* ----------------------- Activity Logging ----------------------- */
+/**
+ * Log user activity to the activity log table
+ */
+async function logActivity(userId, activityType, activityData = {}, chatId = null, chatType = null) {
+  try {
+    await pool.query(
+      `INSERT INTO user_activity_log (user_id, activity_type, activity_data, chat_id, chat_type, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, activityType, JSON.stringify(activityData), chatId, chatType, Date.now()]
+    );
+  } catch (error) {
+    console.error('Error logging activity:', error);
+  }
+}
+
+/**
+ * Get user activity logs with optional filters
+ */
+async function getUserActivityLogs(userId, options = {}) {
+  const { limit = 100, activityType = null, startTime = null, endTime = null } = options;
+  
+  let query = 'SELECT * FROM user_activity_log WHERE user_id = $1';
+  const params = [userId];
+  let paramCount = 2;
+  
+  if (activityType) {
+    query += ` AND activity_type = $${paramCount}`;
+    params.push(activityType);
+    paramCount++;
+  }
+  
+  if (startTime) {
+    query += ` AND timestamp >= $${paramCount}`;
+    params.push(startTime);
+    paramCount++;
+  }
+  
+  if (endTime) {
+    query += ` AND timestamp <= $${paramCount}`;
+    params.push(endTime);
+    paramCount++;
+  }
+  
+  query += ` ORDER BY timestamp DESC LIMIT $${paramCount}`;
+  params.push(limit);
+  
+  const result = await pool.query(query, params);
+  return result.rows;
+}
+
+/**
+ * Get activity statistics for a user
+ */
+async function getUserActivityStats(userId, timeRange = 24 * 60 * 60 * 1000) {
+  const startTime = Date.now() - timeRange;
+  
+  const result = await pool.query(
+    `SELECT 
+      activity_type,
+      COUNT(*) as count,
+      MAX(timestamp) as last_occurrence
+     FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2
+     GROUP BY activity_type`,
+    [userId, startTime]
+  );
+  
+  return result.rows;
+}
+
+/* ----------------------- Spam Detection ----------------------- */
+/**
+ * Check if user is spamming based on recent activity
+ */
+async function checkSpamBehavior(userId) {
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+  const fiveMinutesAgo = now - 300000;
+  
+  // Count messages in last minute
+  const recentResult = await pool.query(
+    `SELECT COUNT(*) as count FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2 AND activity_type IN ('message', 'command')`,
+    [userId, oneMinuteAgo]
+  );
+  
+  const messagesLastMinute = parseInt(recentResult.rows[0].count);
+  
+  // Count messages in last 5 minutes
+  const fiveMinResult = await pool.query(
+    `SELECT COUNT(*) as count FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2 AND activity_type IN ('message', 'command')`,
+    [userId, fiveMinutesAgo]
+  );
+  
+  const messagesLastFiveMin = parseInt(fiveMinResult.rows[0].count);
+  
+  // Spam thresholds
+  const isSpamming = messagesLastMinute > 10 || messagesLastFiveMin > 30;
+  const spamScore = (messagesLastMinute * 2) + (messagesLastFiveMin * 0.5);
+  
+  if (isSpamming) {
+    // Throttle user for 5 minutes
+    await updateUser(userId, {
+      spam_score: spamScore,
+      is_throttled: true,
+      throttled_until: now + 300000,
+      last_spam_check: now
+    });
+  } else {
+    // Decay spam score
+    const user = await getUser(userId);
+    const newSpamScore = Math.max(0, (user.spam_score || 0) - 1);
+    await updateUser(userId, {
+      spam_score: newSpamScore,
+      last_spam_check: now
+    });
+  }
+  
+  return { isSpamming, spamScore, messagesLastMinute, messagesLastFiveMin };
+}
+
+/**
+ * Check if user is currently throttled
+ */
+async function isUserThrottled(userId) {
+  const user = await getUser(userId);
+  if (!user) return false;
+  
+  if (user.is_throttled && user.throttled_until) {
+    if (Date.now() < user.throttled_until) {
+      return true;
+    } else {
+      // Throttle expired, remove it
+      await updateUser(userId, {
+        is_throttled: false,
+        throttled_until: null
+      });
+      return false;
+    }
+  }
+  
+  return false;
+}
+
+/* ----------------------- Engagement Tier Classification ----------------------- */
+/**
+ * Calculate and update engagement tier for a user
+ */
+async function updateEngagementTier(userId) {
+  const user = await getUser(userId);
+  if (!user) return null;
+  
+  const now = Date.now();
+  const daysSinceRegistration = (now - user.registered_at) / (1000 * 60 * 60 * 24);
+  const hoursSinceLastSeen = (now - user.last_seen) / (1000 * 60 * 60);
+  
+  // Get activity stats
+  const activityStats = await getUserActivityStats(userId, 7 * 24 * 60 * 60 * 1000); // Last 7 days
+  const totalActivities = activityStats.reduce((sum, stat) => sum + parseInt(stat.count), 0);
+  
+  // Get referral quality
+  const refAnalysis = await analyzeReferralPattern(userId);
+  const referralQuality = parseFloat(refAnalysis.percentage) || 0;
+  
+  // Get completed tasks
+  const completedTasks = await getUserCompletedTasks(userId);
+  const taskCount = completedTasks.length;
+  
+  // Calculate tier score (0-100)
+  let tierScore = 0;
+  
+  // Activity frequency (0-30 points)
+  const activitiesPerDay = totalActivities / 7;
+  tierScore += Math.min(30, activitiesPerDay * 3);
+  
+  // Streak bonus (0-15 points)
+  tierScore += Math.min(15, (user.current_streak || 0) * 1.5);
+  
+  // Task completion (0-20 points)
+  tierScore += Math.min(20, taskCount * 4);
+  
+  // Referral quality (0-15 points)
+  tierScore += (referralQuality / 100) * 15;
+  
+  // Verification bonus (10 points)
+  if (user.verified) tierScore += 10;
+  
+  // Account age bonus (0-10 points)
+  tierScore += Math.min(10, daysSinceRegistration * 0.5);
+  
+  // Penalty for inactivity
+  if (hoursSinceLastSeen > 168) { // 7 days
+    tierScore *= 0.5;
+  } else if (hoursSinceLastSeen > 72) { // 3 days
+    tierScore *= 0.7;
+  }
+  
+  // Determine tier
+  let tier;
+  if (tierScore >= 70) {
+    tier = 'Elite';
+  } else if (tierScore >= 50) {
+    tier = 'Active';
+  } else if (tierScore >= 30) {
+    tier = 'Regular';
+  } else if (tierScore >= 15) {
+    tier = 'Dormant';
+  } else {
+    tier = 'Ghost';
+  }
+  
+  // Update user tier
+  await updateUser(userId, {
+    engagement_tier: tier,
+    tier_updated_at: now
+  });
+  
+  return { tier, tierScore };
+}
+
+/**
+ * Get users by engagement tier
+ */
+async function getUsersByTier(tier) {
+  const result = await pool.query(
+    'SELECT * FROM users WHERE engagement_tier = $1 ORDER BY activity_score DESC',
+    [tier]
+  );
+  return result.rows;
+}
+
+/**
+ * Get tier distribution statistics
+ */
+async function getTierDistribution() {
+  const result = await pool.query(
+    `SELECT engagement_tier, COUNT(*) as count
+     FROM users
+     GROUP BY engagement_tier
+     ORDER BY 
+       CASE engagement_tier
+         WHEN 'Elite' THEN 1
+         WHEN 'Active' THEN 2
+         WHEN 'Regular' THEN 3
+         WHEN 'Dormant' THEN 4
+         WHEN 'Ghost' THEN 5
+       END`
+  );
+  return result.rows;
+}
+
+/* ----------------------- Decay Systems ----------------------- */
+/**
+ * Apply idle decay to inactive users
+ */
+async function applyIdleDecay() {
+  const now = Date.now();
+  const threeDaysAgo = now - (3 * 24 * 60 * 60 * 1000);
+  const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
+  
+  // Get inactive users
+  const result = await pool.query(
+    `SELECT id, activity_score, last_seen FROM users 
+     WHERE last_seen < $1 AND (last_decay_applied IS NULL OR last_decay_applied < $2)`,
+    [threeDaysAgo, now - (24 * 60 * 60 * 1000)]
+  );
+  
+  const users = result.rows;
+  let decayedCount = 0;
+  
+  for (const user of users) {
+    const daysSinceLastSeen = (now - user.last_seen) / (1000 * 60 * 60 * 24);
+    let decayFactor = 1;
+    
+    if (daysSinceLastSeen >= 7) {
+      decayFactor = 0.9; // 10% decay per day after 7 days
+    } else if (daysSinceLastSeen >= 3) {
+      decayFactor = 0.95; // 5% decay per day after 3 days
+    }
+    
+    const newScore = parseFloat(user.activity_score || 0) * decayFactor;
+    
+    await updateUser(user.id, {
+      activity_score: newScore,
+      last_decay_applied: now
+    });
+    
+    decayedCount++;
+  }
+  
+  return { decayedCount, totalChecked: users.length };
+}
+
+/**
+ * Apply referral decay to reduce influence of inactive/fake referrals
+ */
+async function applyReferralDecay() {
+  const allUsers = await getAllUsers();
+  let processedCount = 0;
+  
+  for (const user of allUsers) {
+    const referrals = await getUserReferrals(user.id);
+    if (referrals.length === 0) continue;
+    
+    let activeReferrals = 0;
+    const now = Date.now();
+    const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
+    
+    for (const refId of referrals) {
+      const refUser = await getUser(refId);
+      if (!refUser) continue;
+      
+      // Check if referral is active
+      const isActive = refUser.last_seen > sevenDaysAgo && 
+                      (refUser.message_count || 0) > 5 &&
+                      refUser.verified;
+      
+      if (isActive) activeReferrals++;
+    }
+    
+    // Calculate referral quality score
+    const qualityRatio = referrals.length > 0 ? activeReferrals / referrals.length : 0;
+    
+    // This score can be used in tier calculations
+    // Store it in activity_data for now
+    await logActivity(user.id, 'referral_quality_check', {
+      totalReferrals: referrals.length,
+      activeReferrals,
+      qualityRatio
+    });
+    
+    processedCount++;
+  }
+  
+  return { processedCount };
+}
+
+/**
+ * Run all decay and maintenance tasks
+ */
+async function runMaintenanceTasks() {
+  console.log('🔄 Running maintenance tasks...');
+  
+  const idleDecayResult = await applyIdleDecay();
+  console.log(`✅ Idle decay applied to ${idleDecayResult.decayedCount} users`);
+  
+  const referralDecayResult = await applyReferralDecay();
+  console.log(`✅ Referral decay processed for ${referralDecayResult.processedCount} users`);
+  
+  // Update engagement tiers for all users
+  const allUsers = await getAllUsers();
+  let tiersUpdated = 0;
+  
+  for (const user of allUsers) {
+    try {
+      await updateEngagementTier(user.id);
+      tiersUpdated++;
+    } catch (error) {
+      console.error(`Error updating tier for user ${user.id}:`, error);
+    }
+  }
+  
+  console.log(`✅ Engagement tiers updated for ${tiersUpdated} users`);
+  
+  return {
+    idleDecay: idleDecayResult,
+    referralDecay: referralDecayResult,
+    tiersUpdated
+  };
+}
+
+/* ----------------------- Enhanced Bot Detection ----------------------- */
+/**
+ * Comprehensive bot/fake user detection
+ */
+async function detectBotOrFakeUser(userId) {
+  const user = await getUser(userId);
+  if (!user) return { isFake: true, isBot: true, confidence: 100, reasons: ['User not found'] };
+  
+  const now = Date.now();
+  const hoursSinceRegistration = (now - user.registered_at) / (1000 * 60 * 60);
+  const daysSinceRegistration = hoursSinceRegistration / 24;
+  
+  const reasons = [];
+  let botScore = 0;
+  let fakeScore = 0;
+  
+  // Check 1: No activity at all
+  if ((user.message_count || 0) === 0 && hoursSinceRegistration > 24) {
+    fakeScore += 30;
+    reasons.push('No messages after 24h');
+  }
+  
+  // Check 2: No username
+  if (!user.username) {
+    botScore += 15;
+    reasons.push('No username');
+  }
+  
+  // Check 3: Very low activity score
+  if ((user.activity_score || 0) < 0.01 && daysSinceRegistration > 1) {
+    fakeScore += 20;
+    reasons.push('Extremely low activity score');
+  }
+  
+  // Check 4: Never verified
+  if (!user.verified && daysSinceRegistration > 7) {
+    botScore += 10;
+    reasons.push('Not verified after 7 days');
+  }
+  
+  // Check 5: No wallet set
+  if (!user.wallet && daysSinceRegistration > 3) {
+    botScore += 10;
+    reasons.push('No wallet after 3 days');
+  }
+  
+  // Check 6: Check activity patterns
+  const activityStats = await getUserActivityStats(userId, 7 * 24 * 60 * 60 * 1000);
+  const totalActivities = activityStats.reduce((sum, stat) => sum + parseInt(stat.count), 0);
+  
+  if (totalActivities === 0 && daysSinceRegistration > 1) {
+    fakeScore += 25;
+    reasons.push('No activity in last 7 days');
+  }
+  
+  // Check 7: Suspicious activity pattern (all same type)
+  if (activityStats.length === 1 && totalActivities > 20) {
+    botScore += 15;
+    reasons.push('Repetitive activity pattern');
+  }
+  
+  // Check 8: No completed tasks
+  const completedTasks = await getUserCompletedTasks(userId);
+  if (completedTasks.length === 0 && daysSinceRegistration > 7) {
+    botScore += 10;
+    reasons.push('No completed tasks');
+  }
+  
+  // Check 9: High spam score
+  if ((user.spam_score || 0) > 20) {
+    botScore += 20;
+    reasons.push('High spam score');
+  }
+  
+  // Check 10: Referral pattern analysis
+  const refAnalysis = await analyzeReferralPattern(userId);
+  if (parseFloat(refAnalysis.percentage) < 20 && (refAnalysis.realRefs + refAnalysis.suspiciousRefs) > 5) {
+    botScore += 15;
+    reasons.push('Poor referral quality');
+  }
+  
+  const totalScore = Math.max(botScore, fakeScore);
+  const isBot = botScore > 50;
+  const isFake = fakeScore > 50;
+  const confidence = Math.min(100, totalScore);
+  
+  return {
+    isBot,
+    isFake,
+    botScore,
+    fakeScore,
+    confidence,
+    reasons,
+    classification: isFake ? 'Fake' : isBot ? 'Bot' : confidence > 30 ? 'Suspicious' : 'Real'
+  };
+}
+
 /* ----------------------- Verification advancement helper ----------------------- */
 async function verifyUserAndReward(refereeId) {
   const client = await pool.connect();
@@ -926,5 +1477,22 @@ module.exports = {
   analyzeReferralPattern,
   getDetailedReferralAnalysis,
   verifyUserAndReward,
+  // Activity tracking
+  logActivity,
+  getUserActivityLogs,
+  getUserActivityStats,
+  // Spam detection
+  checkSpamBehavior,
+  isUserThrottled,
+  // Engagement tiers
+  updateEngagementTier,
+  getUsersByTier,
+  getTierDistribution,
+  // Decay systems
+  applyIdleDecay,
+  applyReferralDecay,
+  runMaintenanceTasks,
+  // Bot detection
+  detectBotOrFakeUser,
   pool
 };
