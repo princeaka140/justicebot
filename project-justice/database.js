@@ -752,7 +752,8 @@ async function getDetailedReferralAnalysis(userId) {
         referralCount: 0,
         totalWithdrawn: 0,
         pendingWithdrawals: 0,
-        lastSeen: 'Never'
+        lastSeen: 'Never',
+        isFake: true
       });
       continue;
     }
@@ -761,6 +762,7 @@ async function getDetailedReferralAnalysis(userId) {
     const activityScore = refUser.activity_score || 0;
     const hasWallet = refUser.wallet && refUser.wallet.length > 0;
     const isVerified = refUser.verified;
+    const hasUsername = refUser.username && refUser.username.length > 0;
     const accountAge = Date.now() - refUser.registered_at;
     const hoursSinceRegistration = accountAge / (1000 * 60 * 60);
     const daysSinceRegistration = accountAge / (1000 * 60 * 60 * 24);
@@ -770,7 +772,7 @@ async function getDetailedReferralAnalysis(userId) {
     const referralCount = await getReferralCount(refId);
     const withdrawalStats = await getUserWithdrawalStats(refId);
     
-    // Calculate detailed score (max 13 points)
+    // Calculate detailed score (max 15 points)
     let score = 0;
     
     // Message activity (0-3 points)
@@ -794,21 +796,26 @@ async function getDetailedReferralAnalysis(userId) {
 
     // Completed tasks (0-2 points)
     if (completedTasks.length > 0) score += 2;
+    
+    // Has username (0-2 points) - NEW
+    if (hasUsername) score += 2;
 
     // Determine classification and emoji with enhanced fake detection
     let classification, statusEmoji, scoreStars;
     
-    // Enhanced fake detection logic
+    // ENHANCED fake detection logic - automatically flag users without username
     const isFake = (
-      messageCount === 0 && 
-      completedTasks.length === 0 && 
-      !isVerified && 
-      !hasWallet && 
-      hoursSinceRegistration < 1 &&
-      referralCount === 0
+      !hasUsername || // Automatically flag if no username
+      (messageCount === 0 && 
+       completedTasks.length === 0 && 
+       !isVerified && 
+       !hasWallet && 
+       hoursSinceRegistration < 1 &&
+       referralCount === 0)
     );
     
     const isLikelyBot = (
+      !isFake &&
       messageCount === 0 && 
       completedTasks.length === 0 && 
       hoursSinceRegistration < 24 &&
@@ -819,15 +826,15 @@ async function getDetailedReferralAnalysis(userId) {
       classification = 'Fake';
       statusEmoji = '🚫';
       scoreStars = '❌';
-    } else if (score >= 8) {
+    } else if (score >= 10) {
       classification = 'Real User';
       statusEmoji = '✅';
       scoreStars = '⭐⭐⭐⭐⭐';
-    } else if (score >= 5) {
+    } else if (score >= 7) {
       classification = 'Real User';
       statusEmoji = '✅';
       scoreStars = '⭐⭐⭐⭐';
-    } else if (score >= 3) {
+    } else if (score >= 4) {
       classification = 'Suspicious';
       statusEmoji = '⚠️';
       scoreStars = '⭐⭐⭐';
@@ -880,11 +887,13 @@ async function getDetailedReferralAnalysis(userId) {
       accountAge: ageString,
       verified: isVerified,
       hasWallet,
+      hasUsername,
       referralCount,
       totalWithdrawn: withdrawalStats.totalWithdrawn,
       pendingWithdrawals: withdrawalStats.pendingCount,
       lastSeen: lastSeenString,
-      registeredAt: new Date(refUser.registered_at).toLocaleString()
+      registeredAt: new Date(refUser.registered_at).toLocaleString(),
+      isFake
     });
   }
 
@@ -1312,10 +1321,10 @@ async function detectBotOrFakeUser(userId) {
     reasons.push('No messages after 24h');
   }
   
-  // Check 2: No username
-  if (!user.username) {
-    botScore += 15;
-    reasons.push('No username');
+  // Check 2: No username - AUTOMATICALLY FLAG AS FAKE
+  if (!user.username || user.username.length === 0) {
+    fakeScore += 40; // Increased from 15 to 40
+    reasons.push('No username - automatically flagged as fake');
   }
   
   // Check 3: Very low activity score
@@ -1434,6 +1443,113 @@ async function verifyUserAndReward(refereeId) {
   }
 }
 
+/**
+ * Get referrer information for a user
+ */
+async function getReferrerInfo(userId) {
+  const user = await getUser(userId);
+  if (!user || !user.referred_by) return null;
+  
+  const referrer = await getUser(user.referred_by);
+  if (!referrer) return null;
+  
+  return {
+    id: referrer.id,
+    username: referrer.username,
+    verified: referrer.verified,
+    registeredAt: referrer.registered_at
+  };
+}
+
+/**
+ * Rebuild activity history from registration to present
+ */
+async function rebuildUserActivityHistory(userId) {
+  const user = await getUser(userId);
+  if (!user) return { success: false, message: 'User not found' };
+  
+  const registrationDate = new Date(user.registered_at);
+  const today = new Date();
+  const daysSinceRegistration = Math.floor((today - registrationDate) / (1000 * 60 * 60 * 24));
+  
+  // Get all activity logs for this user
+  const activityLogs = await getUserActivityLogs(userId, { limit: 10000 });
+  
+  // Rebuild streak based on activity logs
+  const activityDates = new Set();
+  activityLogs.forEach(log => {
+    const logDate = new Date(log.timestamp).toISOString().split('T')[0];
+    activityDates.add(logDate);
+  });
+  
+  // Calculate current streak
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let tempStreak = 0;
+  
+  const sortedDates = Array.from(activityDates).sort().reverse();
+  const todayStr = today.toISOString().split('T')[0];
+  
+  for (let i = 0; i < sortedDates.length; i++) {
+    const currentDate = new Date(sortedDates[i]);
+    const nextDate = sortedDates[i + 1] ? new Date(sortedDates[i + 1]) : null;
+    
+    tempStreak++;
+    
+    if (nextDate) {
+      const dayDiff = Math.floor((currentDate - nextDate) / (1000 * 60 * 60 * 24));
+      if (dayDiff !== 1) {
+        longestStreak = Math.max(longestStreak, tempStreak);
+        if (i === 0) currentStreak = tempStreak;
+        tempStreak = 0;
+      }
+    } else {
+      longestStreak = Math.max(longestStreak, tempStreak);
+      if (i === 0) currentStreak = tempStreak;
+    }
+  }
+  
+  // Update user with rebuilt data
+  await updateUser(userId, {
+    current_streak: currentStreak,
+    longest_streak: longestStreak
+  });
+  
+  return {
+    success: true,
+    currentStreak,
+    longestStreak,
+    totalActivityDays: activityDates.size,
+    daysSinceRegistration
+  };
+}
+
+/**
+ * Update submission status (for atomic operations)
+ */
+async function updateSubmissionStatus(submissionId, status, reviewedBy) {
+  await pool.query(
+    'UPDATE task_submissions SET status = $1, reviewed_at = $2, reviewed_by = $3 WHERE id = $4',
+    [status, Date.now(), reviewedBy, submissionId]
+  );
+}
+
+/**
+ * Flag user as fake (for join/leave tracking)
+ */
+async function flagUserAsFake(userId, reason = 'Joined and left group') {
+  try {
+    await logActivity(userId, 'flagged_as_fake', { reason }, null, null);
+    
+    // Update user to mark as suspicious
+    await updateUser(userId, {
+      spam_score: Math.min(100, (await getUser(userId))?.spam_score || 0 + 50)
+    });
+  } catch (error) {
+    console.error('Error flagging user as fake:', error);
+  }
+}
+
 module.exports = {
   initializeDatabase,
   getUser,
@@ -1443,6 +1559,7 @@ module.exports = {
   addReferral,
   getUserReferrals,
   getReferralCount,
+  getReferrerInfo,
   createTask,
   getTasks,
   getTaskById,
@@ -1454,6 +1571,7 @@ module.exports = {
   getLatestPendingSubmission,
   approveSubmissionAtomic,
   rejectSubmissionAtomic,
+  updateSubmissionStatus,
   getPendingSubmissions: async () => {
     const r = await pool.query("SELECT * FROM task_submissions WHERE status = 'pending' ORDER BY submitted_at ASC");
     return r.rows;
@@ -1477,6 +1595,8 @@ module.exports = {
   analyzeReferralPattern,
   getDetailedReferralAnalysis,
   verifyUserAndReward,
+  flagUserAsFake,
+  rebuildUserActivityHistory,
   // Activity tracking
   logActivity,
   getUserActivityLogs,
