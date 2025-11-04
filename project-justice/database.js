@@ -1,2326 +1,1642 @@
-require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
-const os = require("os");
-const si = require('systeminformation');
-const process = require("process");
-const fs = require('fs');
-const path = require('path');
-const db = require('./database');
+const { Pool } = require('pg');
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-// Parse JSON bodies (needed for webhook POSTs)
-app.use(express.json());
-
-app.get('/', (req, res) => {
-  res.send("I'm alive! Bot is running.");
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-// Optional endpoint to trigger webhook setup manually (useful for debugging)
-app.get('/setup-webhook', async (req, res) => {
+/**
+ * initializeDatabase()
+ * - Creates schema for users, referrals, tasks, submissions, completed tasks,
+ *   bot settings, withdrawals and blacklist.
+ * - Adds useful indexes and seeds default settings.
+ */
+async function initializeDatabase() {
+  const client = await pool.connect();
   try {
-    await setupWebhook();
-    res.send("Webhook setup attempted - check logs.");
-  } catch (e) {
-    res.status(500).send("Failed to setup webhook, see logs.");
-  }
-});
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id BIGINT PRIMARY KEY,
+        username TEXT,
+        balance NUMERIC(20,2) DEFAULT 0,
+        wallet TEXT,
+        referred_by BIGINT,
+        verified BOOLEAN DEFAULT FALSE,
+        registered_at BIGINT NOT NULL,
+        last_seen BIGINT NOT NULL,
+        message_count INTEGER DEFAULT 0,
+        activity_score DECIMAL(10,4) DEFAULT 0,
+        last_bonus_claim BIGINT DEFAULT 0,
+        
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      -- Add new columns if they don't exist (migration)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS longest_streak INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_date DATE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS engagement_tier TEXT DEFAULT 'Regular';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS tier_updated_at BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS spam_score DECIMAL(10,4) DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spam_check BIGINT DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_throttled BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS throttled_until BIGINT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS group_message_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_message_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS command_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS button_click_count INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_decay_applied BIGINT DEFAULT 0;
 
-const token = process.env.BOT_TOKEN;
-if (!token) {
-  console.error('Error: BOT_TOKEN is not set in environment variables');
-  process.exit(1);
-}
+      CREATE TABLE IF NOT EXISTS referrals (
+        referrer_id BIGINT NOT NULL,
+        referred_id BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (referrer_id, referred_id),
+        FOREIGN KEY (referrer_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (referred_id) REFERENCES users(id) ON DELETE CASCADE
+      );
 
-// Create bot WITHOUT polling — we'll use webhook
-const bot = new TelegramBot(token);
+      CREATE TABLE IF NOT EXISTS tasks (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        reward NUMERIC(20,2) NOT NULL,
+        created_at BIGINT NOT NULL,
+        created_by BIGINT,
+        status TEXT DEFAULT 'active'
+      );
 
-// Webhook configuration
-const HOST = process.env.HOST; // e.g. https://yourdomain.com (MUST be HTTPS)
-const WEBHOOK_PATH = `/bot${token}`; // route to receive updates
-const WEBHOOK_URL = HOST ? `${HOST}${WEBHOOK_PATH}` : null;
-const WEBHOOK_CERT_PATH = process.env.WEBHOOK_CERT_PATH || ''; // optional, for self-signed cert upload
+      CREATE TABLE IF NOT EXISTS task_submissions (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        task_id INTEGER NOT NULL,
+        task_title TEXT,
+        task_reward NUMERIC(20,2),
+        description TEXT,
+        files JSONB DEFAULT '[]',
+        status TEXT DEFAULT 'pending',
+        submitted_at BIGINT NOT NULL,
+        reviewed_at BIGINT,
+        reviewed_by BIGINT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+      );
 
-// Helper: set webhook (delete/clear previous webhook first)
-async function setupWebhook() {
-  if (!WEBHOOK_URL) {
-    console.warn('HOST not provided. Webhook not set. Set process.env.HOST to your public HTTPS URL (e.g. https://example.com).');
-    return;
-  }
+      CREATE TABLE IF NOT EXISTS completed_tasks (
+        user_id BIGINT NOT NULL,
+        task_id INTEGER NOT NULL,
+        completed_at BIGINT NOT NULL,
+        reward NUMERIC(20,2),
+        PRIMARY KEY (user_id, task_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+      );
 
-  if (!WEBHOOK_URL.startsWith('https://')) {
-    console.warn('Webhook URL must use HTTPS. Webhook was not set. Use a valid HTTPS URL in process.env.HOST.');
-    return;
-  }
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  try {
-    console.log('Deleting existing webhook (if any) and dropping pending updates...');
-    // delete existing webhook & drop pending updates to clear state
-    await bot.deleteWebHook({ drop_pending_updates: true });
-  } catch (err) {
-    console.warn('Warning: deleteWebHook returned error (continuing):', err && (err.response?.body || err.message || err));
-  }
+      CREATE TABLE IF NOT EXISTS withdrawal_requests (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        amount NUMERIC(20,2) NOT NULL,
+        wallet TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        requested_at BIGINT NOT NULL,
+        reviewed_at BIGINT,
+        reviewed_by BIGINT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
 
-  try {
-    console.log('Setting webhook to:', WEBHOOK_URL);
-    if (WEBHOOK_CERT_PATH && fs.existsSync(WEBHOOK_CERT_PATH)) {
-      // If you have a self-signed cert, upload it to Telegram
-      const certStream = fs.createReadStream(WEBHOOK_CERT_PATH);
-      await bot.setWebHook(WEBHOOK_URL, { certificate: certStream });
-    } else {
-      await bot.setWebHook(WEBHOOK_URL);
-    }
-    console.log('Webhook set successfully.');
-  } catch (err) {
-    console.error('Failed to set webhook:', err && (err.response?.body || err.message || err));
-    throw err;
-  }
-}
+      CREATE TABLE IF NOT EXISTS blacklist (
+        user_id BIGINT PRIMARY KEY,
+        reason TEXT,
+        blacklisted_by BIGINT NOT NULL,
+        blacklisted_at BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-// Register express route to receive updates from Telegram
-app.post(WEBHOOK_PATH, (req, res) => {
-  try {
-    // Process update with node-telegram-bot-api
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('Error processing update:', err && err.message);
-    res.sendStatus(500);
-  }
-});
+      CREATE TABLE IF NOT EXISTS user_activity_log (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        activity_type TEXT NOT NULL,
+        activity_data JSONB DEFAULT '{}',
+        chat_id BIGINT,
+        chat_type TEXT,
+        timestamp BIGINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
 
-// Start server and setup webhook
-app.listen(PORT, async () => {
-  console.log(`Keep-alive server is running on port ${PORT}`);
-  try {
-    await setupWebhook();
-  } catch (err) {
-    console.error('Webhook setup failed. Make sure HOST is reachable and HTTPS. You can fallback to polling for local testing.');
-  }
-});
+      -- Create indexes (will skip if already exist)
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_username') THEN
+          CREATE INDEX idx_users_username ON users(username);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_verified') THEN
+          CREATE INDEX idx_users_verified ON users(verified);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_engagement_tier') THEN
+          CREATE INDEX idx_users_engagement_tier ON users(engagement_tier);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_last_activity_date') THEN
+          CREATE INDEX idx_users_last_activity_date ON users(last_activity_date);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_referrals_referrer') THEN
+          CREATE INDEX idx_referrals_referrer ON referrals(referrer_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_task_submissions_user') THEN
+          CREATE INDEX idx_task_submissions_user ON task_submissions(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_task_submissions_status') THEN
+          CREATE INDEX idx_task_submissions_status ON task_submissions(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_tasks_status') THEN
+          CREATE INDEX idx_tasks_status ON tasks(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_withdrawal_requests_status') THEN
+          CREATE INDEX idx_withdrawal_requests_status ON withdrawal_requests(status);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_blacklist_user') THEN
+          CREATE INDEX idx_blacklist_user ON blacklist(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_user') THEN
+          CREATE INDEX idx_activity_log_user ON user_activity_log(user_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_timestamp') THEN
+          CREATE INDEX idx_activity_log_timestamp ON user_activity_log(timestamp);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_activity_log_type') THEN
+          CREATE INDEX idx_activity_log_type ON user_activity_log(activity_type);
+        END IF;
+      END $$;
+    `);
 
-/* ---------- Database init ---------- */
-async function initializeBotDatabase() {
-  try {
-    await db.initializeDatabase();
-    console.log('✅ Bot database initialized successfully');
-    
-    // Start automatic maintenance tasks every 6 hours
-    setInterval(async () => {
-      console.log('🔄 Running scheduled maintenance tasks...');
-      try {
-        await db.runMaintenanceTasks();
-        console.log('✅ Scheduled maintenance completed');
-      } catch (error) {
-        console.error('❌ Maintenance task error:', error);
-      }
-    }, 6 * 60 * 60 * 1000); // 6 hours
-    
-    // Start automatic tracking update every 10 minutes
-    setInterval(async () => {
-      console.log('🔄 Running tracking updates...');
-      try {
-        const allUsers = await db.getAllUsers();
-        for (const user of allUsers) {
-          await db.updateEngagementTier(user.id);
-        }
-        console.log('✅ Tracking updates completed');
-      } catch (error) {
-        console.error('❌ Tracking update error:', error);
-      }
-    }, 10 * 60 * 1000); // 10 minutes
-    
+    await client.query(`
+      INSERT INTO bot_settings (key, value) VALUES
+        ('referralReward', '20'),
+        ('bonusAmount', '3'),
+        ('withdrawalOpen', 'false'),
+        ('tasksSubmitted', '0'),
+        ('tasksApproved', '0'),
+        ('tasksRejected', '0'),
+        ('minWithdrawal', '50'),
+        ('maxWithdrawal', '10000')
+      ON CONFLICT (key) DO NOTHING;
+    `);
+
+    console.log('✅ Database initialized successfully');
   } catch (error) {
-    console.error('❌ Bot database initialization failed:', error);
-    process.exit(1);
-  }
-}
-initializeBotDatabase();
-
-/* ---------- Config constants ---------- */
-const ADMIN_IDS = [ 7561048693, 6450400107, 5470178483, 5713536787, 6221435595, -1003140359659];
-const ADMIN_GROUP_ID = Number(process.env.ADMIN_GROUP_ID || -1003140359659);
-const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL || "@livetransactiontrack";
-
-const VERIFY_CHANNELS = [
-  "@livetransactiontrack",
-  "@Justiceonsolana1",
-  "@justiceonsolana",
-  "@ComeOEXOfficial",
-  "https://x.com/onchain_justice?t=6QUIvpSUESeDRUGwDXoZSQ&s=09"
-];
-
-const CHANNELS_TO_VERIFY = [
-  "@livetransactiontrack",
-  "@Justiceonsolana1",
-  "@justiceonsolana"
-];
-
-const BOT_USERNAME = process.env.BOT_USERNAME || "justiceonsolana333bot";
-const ABOUT_US_URL = process.env.ABOUT_US_URL || "https://t.me/justiceonsolana/5";
-const SUPPORT_URL = process.env.SUPPORT_URL || "https://t.me/justiceonsolbot";
-
-const TASK_REVIEW_CHANNEL = process.env.TASK_REVIEW_CHANNEL || "@livetransactiontrack";
-const WITHDRAW_REVIEW_CHANNEL = process.env.WITHDRAW_REVIEW_CHANNEL || "@livetransactiontrack";
-
-const CURRENCY_SYMBOL = "⚖️";
-const BOT_NAME = "JUSTICE on Sol";
-
-let pendingTasks = {};
-let awaitingWallet = {};
-const awaitingIntroUpload = {}; // admin flow for /introvideo
-global.userLatestMessage = {}; // Track last message per user per chat
-
-/* ---------- Utility helpers (copied & merged from working code) ---------- */
-function isAdminId(id) {
-  return ADMIN_IDS.indexOf(Number(id)) !== -1;
-}
-
-async function getUserIdentifier(userId) {
-  const user = await db.getUser(userId);
-  if (user && user.username) {
-    return `@${user.username}`;
-  }
-  return userId;
-}
-
-async function resolveUserInput(input) {
-  if (typeof input === 'string' && input.startsWith('@')) {
-    const username = input.substring(1).toLowerCase();
-    const users = await db.getAllUsers();
-    for (const user of users) {
-      if (user.username && user.username.toLowerCase() === username) {
-        return user.id;
-      }
-    }
-    return null;
-  }
-  return input;
-}
-
-function getStarRating(percentage) {
-  if (percentage >= 100) return "🌟🌟🌟🌟🌟";
-  if (percentage >= 70) return "🌟🌟🌟🌟";
-  if (percentage >= 40) return "🌟🌟🌟";
-  if (percentage >= 25) return "🌟🌟";
-  if (percentage >= 10) return "🌟";
-  if (percentage >= 8) return "❌";
-  return "❌❌❌❌❌";
-}
-
-async function logAdmin(text) {
-  try {
-    await bot.sendMessage(BROADCAST_CHANNEL, text);
-  } catch (e) {
-    console.error('Error logging to admin:', e && e.message);
+    console.error('❌ Database initialization error:', error);
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
-async function sendEphemeralWarning(chatId, text, timeout = 2000) {
-  try {
-    const msg = await bot.sendMessage(chatId, text);
-    setTimeout(async () => {
-      try {
-        await bot.deleteMessage(chatId, msg.message_id);
-      } catch (e) {}
-    }, timeout);
-  } catch (e) {}
+/* ----------------------- Basic user functions ----------------------- */
+async function getUser(userId) {
+  const result = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+  return result.rows[0] || null;
 }
 
-async function sendAutoDeleteMessage(chatId, text, timeout = 120000) {
-  try {
-    const msg = await bot.sendMessage(chatId, text);
-    setTimeout(async () => {
-      try {
-        await bot.deleteMessage(chatId, msg.message_id);
-      } catch (e) {}
-    }, timeout);
-    return msg;
-  } catch (e) {
-    return null;
-  }
+async function createUser(userId, username = '') {
+  const now = Date.now();
+  const today = new Date().toISOString().split('T')[0];
+  const result = await pool.query(
+    `INSERT INTO users (
+      id, username, balance, wallet, verified, registered_at, last_seen, 
+      message_count, activity_score, last_bonus_claim, current_streak, 
+      longest_streak, last_activity_date, engagement_tier, spam_score,
+      group_message_count, bot_message_count, command_count, button_click_count
+    )
+     VALUES ($1, $2, 0, '', FALSE, $3, $3, 0, 0, 0, 0, 0, $4, 'Regular', 0, 0, 0, 0, 0)
+     ON CONFLICT (id) DO UPDATE SET
+       username = EXCLUDED.username,
+       last_seen = EXCLUDED.last_seen
+     RETURNING *`,
+    [userId, username, now, today]
+  );
+  return result.rows[0];
 }
 
-// =============== Auto-delete helper ====================
-async function sendAndAutoDelete(chatId, text, timeout = 30000, options = {}) {
-  try {
-    const sent = await bot.sendMessage(chatId, text, options);
-    setTimeout(() => {
-      bot.deleteMessage(chatId, sent.message_id).catch(() => {});
-    }, timeout);
-    return sent;
-  } catch (e) { 
-    return null; 
+async function updateUser(userId, updates) {
+  const fields = [];
+  const values = [];
+  let paramCount = 1;
+
+  for (const [key, value] of Object.entries(updates)) {
+    fields.push(`${key} = $${paramCount}`);
+    values.push(value);
+    paramCount++;
   }
+
+  if (fields.length === 0) return null;
+
+  fields.push(`updated_at = CURRENT_TIMESTAMP`);
+  values.push(userId);
+
+  const result = await pool.query(
+    `UPDATE users SET ${fields.join(', ')} WHERE id = $${paramCount} RETURNING *`,
+    values
+  );
+  return result.rows[0];
 }
 
-async function deleteMessageLater(chatId, message_id, timeout = 30000) {
-  setTimeout(() => {
-    bot.deleteMessage(chatId, message_id).catch(() => {});
-  }, timeout);
-}
+async function ensureUser(userId, username = null, updateActivity = false, activityContext = {}) {
+  let user = await getUser(userId);
 
-// Broadcast helper (review/admin channel notification)
-async function broadcastAdminAction(msgText) {
-  try {
-    await bot.sendMessage(TASK_REVIEW_CHANNEL, msgText);
-  } catch (e) {
-    console.error('Error broadcasting admin action:', e && e.message);
-  }
-}
-
-function isHttpUrl(str) {
-  try {
-    const url = new URL(str);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch (e) {
-    return false;
-  }
-}
-
-/**
- * Sanitize HTML used with parse_mode='HTML' for Telegram.
- * - Replaces <br> tags with newlines.
- * - Keeps allowed tags like <b>, <i>, <a>, <code>, <pre>.
- */
-function sanitizeHtmlForTelegram(html) {
-  if (!html || typeof html !== 'string') return '';
-  // Replace <br> tags with newline
-  let out = html.replace(/<br\s*\/?>/gi, '\n');
-  // Trim extra spaces
-  out = out.trim();
-  return out;
-}
-
-/**
- * Helper for sending welcome media:
- * - Accepts local file path, Telegram file_id, or direct media URL (mp4/webm/gif).
- * - If provided a web page URL (Vimeo page or similar), it will send the welcome text with a Watch button instead.
- */
-async function trySendVideoOrAnimation(source, chatId, welcomeText, replyKeyboard) {
-  const directMediaExt = /\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i;
-  const isUrl = typeof source === 'string' && isHttpUrl(source);
-  const isLocalFile = typeof source === 'string' && fs.existsSync(source);
-  const looksLikeDirectMedia = (isUrl && directMediaExt.test(source)) || isLocalFile;
-
-  const sanitizedText = sanitizeHtmlForTelegram(welcomeText);
-
-  // If it's a webpage URL (Vimeo/watch page), send as text + watch button (use inline keyboard)
-  if (isUrl && !looksLikeDirectMedia) {
-    console.log('Info: welcome source is a webpage — sending text with link button.');
-    const inline = { inline_keyboard: [[{ text: "▶️ Watch video", url: source }]] };
-    try {
-      await bot.sendMessage(chatId, sanitizedText, {
-        parse_mode: 'HTML',
-        reply_markup: inline
-      });
-    } catch (err) {
-      console.error('Failed to send fallback welcome message:', err && (err.response?.body || err.message || err));
-    }
-    return;
-  }
-
-  // If local file exists, stream it
-  if (isLocalFile) {
-    try {
-      const stream = fs.createReadStream(source);
-      const res = await bot.sendVideo(chatId, stream, {
-        caption: sanitizedText,
-        parse_mode: 'HTML',
-        reply_markup: replyKeyboard
-      });
-      console.log('✅ Sent local video file. file_id:', res.video && res.video.file_id);
-      return;
-    } catch (err) {
-      console.warn('sendVideo from local file failed:', err && (err.response?.body || err.message || err));
-      // fall through to trying other methods
-    }
-  }
-
-  // Try sending as video (works for file_id or direct media URL)
-  try {
-    const res = await bot.sendVideo(chatId, source, {
-      caption: sanitizedText,
-      parse_mode: 'HTML',
-      reply_markup: replyKeyboard
-    });
-    console.log('✅ Sent as video (file_id or direct URL). file_id:', res.video && res.video.file_id);
-    return;
-  } catch (videoError) {
-    console.warn('sendVideo failed:', videoError && (videoError.response?.body || videoError.message || videoError));
-    // Try as animation (GIF)
-    try {
-      const res2 = await bot.sendAnimation(chatId, source, {
-        caption: sanitizedText,
-        parse_mode: 'HTML',
-        reply_markup: replyKeyboard
-      });
-      console.log('✅ Sent as animation. file_id:', res2.animation && res2.animation.file_id);
-      return;
-    } catch (animError) {
-      console.warn('sendAnimation failed:', animError && (animError.response?.body || animError.message || animError));
-      // Finally, fallback to sendMessage (use sanitized text)
-      try {
-        await bot.sendMessage(chatId, sanitizedText, {
-          parse_mode: 'HTML',
-          reply_markup: replyKeyboard
-        });
-        console.log('✅ Sent fallback welcome text');
-      } catch (msgErr) {
-        console.error('❌ Failed to send fallback welcome text:', msgErr && (msgErr.response?.body || msgErr.message || msgErr));
-      }
-    }
-  }
-}
-
-/* ---------- Monkey-patch send methods to track replies (used by auto-delete) ---------- */
-const recentReplies = new Map();
-function patchSend(method) {
-  const original = bot[method].bind(bot);
-  bot[method] = async (...args) => {
-    const msg = await original(...args);
-    bot.emit("sent_reply", msg);
-    return msg;
-  };
-}
-["sendMessage", "sendPhoto", "sendDocument", "sendVideo", "sendAnimation", "sendAudio", "sendMediaGroup"].forEach(
-  patchSend
-);
-
-/* ---------- ADMIN: /introvideo and /cancelintro handlers ---------- */
-/*
-  Usage:
-   - /introvideo                -> enter interactive upload mode (send media, URL, or file_id)
-   - /introvideo <url-or-fileid> -> quick set (no upload mode)
-   - /cancelintro               -> cancel interactive mode
-*/
-bot.onText(/\/introvideo(?:\s+(.+))?/, async (msg, match) => {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const param = match && match[1] ? match[1].trim() : null;
-  if (param) {
-    // Quick-set mode: admin provided a URL or file_id inline
-    try {
-      if (/^https?:\/\//i.test(param)) {
-        const type = (/\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i.test(param)) ? 'url_media' : 'url_page';
-        await db.setSetting('introVideo', param);
-        await db.setSetting('introVideoType', type);
-        await bot.sendMessage(chatId, `✅ Intro saved as URL (type: ${type}).`);
-      } else {
-        // treat as file_id or text
-        const t = param;
-        const inferredType = /^\d+:[A-Za-z0-9_-]+$/.test(t) ? 'file_id' : 'file_id';
-        await db.setSetting('introVideo', t);
-        await db.setSetting('introVideoType', inferredType);
-        await bot.sendMessage(chatId, '✅ Intro saved as file_id/text.');
-      }
-    } catch (err) {
-      console.error('Error saving intro (quick mode):', err && (err.response?.body || err.message || err));
-      await bot.sendMessage(chatId, '❌ Failed to save intro. Check server logs for details.');
-    }
-    return;
-  }
-
-  // Interactive mode
-  awaitingIntroUpload[userId] = true;
-  await bot.sendMessage(chatId, '📹 Please send the intro video, animation (GIF), document, file_id, or media/web URL. Send /cancelintro to abort.');
-});
-
-bot.onText(/\/cancelintro/, async (msg) => {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  if (awaitingIntroUpload[userId]) {
-    delete awaitingIntroUpload[userId];
-    await bot.sendMessage(chatId, '❌ Intro upload cancelled.');
+  if (!user) {
+    user = await createUser(userId, username);
   } else {
-    await bot.sendMessage(chatId, 'No intro upload in progress.');
-  }
-});
-
-/* ---------- Activity Tracking Middleware ---------- */
-bot.on('message', async (m) => {
-  if (!m.from || m.from.is_bot) return;
-  const uid = m.from.id;
-  const chatId = m.chat.id;
-  const text = m.text;
-  const username = m.from.username || '';
-  
-  // Track all activity in admin group and bot
-  const isAdminGroup = chatId === ADMIN_GROUP_ID;
-  const chatType = m.chat.type || 'private';
-  
-  // IMPORTANT: Ensure user exists FIRST before logging activity
-  try {
-    await db.ensureUser(uid, username, true, { chatType, chatId });
-  } catch (error) {
-    console.error('Error ensuring user:', error);
-  }
-  
-  // Log activity AFTER user is created
-  try {
-    const activityType = text?.startsWith('/') ? 'command' : 
-                        m.photo ? 'photo' : 
-                        m.video ? 'video' : 
-                        m.document ? 'document' : 'message';
-    
-    await db.logActivity(uid, activityType, {
-      chatId,
-      chatType,
-      text: text?.substring(0, 100),
-      hasMedia: !!(m.photo || m.video || m.document)
-    }, chatId, chatType);
-    
-    // Update command count if it's a command
-    if (text?.startsWith('/')) {
-      const user = await db.getUser(uid);
-      if (user) {
-        await db.updateUser(uid, {
-          command_count: (user.command_count || 0) + 1
-        });
-      }
+    const updates = { last_seen: Date.now() };
+    if (username && username !== user.username) {
+      updates.username = username;
     }
-    
-    // Check for spam
-    const spamCheck = await db.checkSpamBehavior(uid);
-    if (spamCheck.isSpamming) {
-      await bot.sendMessage(chatId, '⚠️ Slow down! You are sending messages too quickly. Please wait a moment.');
-      return;
-    }
-    
-    // Check if throttled
-    const isThrottled = await db.isUserThrottled(uid);
-    if (isThrottled) {
-      return; // Silently ignore throttled users
-    }
-    
-  } catch (error) {
-    console.error('Activity tracking error:', error);
-  }
 
-  // Debug logging for incoming update
-  console.log(`Incoming message from ${uid} in chat ${chatId} - text: ${text ? text.substring(0,80) : '<no text>'}`);
-
-  // Log incoming file_ids for debugging
-  try {
-    if (m.video) console.log('Received video file_id:', m.video.file_id);
-    if (m.animation) console.log('Received animation file_id:', m.animation.file_id);
-    if (m.document) console.log('Received document file_id:', m.document.file_id);
-    if (m.photo) console.log('Received photo file_ids:', m.photo.map(p => p.file_id).join(','));
-  } catch (e) {}
-
-  // If admin is in intro upload flow, handle saving intro (higher priority)
-  if (awaitingIntroUpload[uid]) {
-    try {
-      if (m.video) {
-        await db.setSetting('introVideo', m.video.file_id);
-        await db.setSetting('introVideoType', 'video');
-        await bot.sendMessage(chatId, '✅ Intro video saved (video.file_id).');
-        delete awaitingIntroUpload[uid];
-        return;
-      }
-      if (m.animation) {
-        await db.setSetting('introVideo', m.animation.file_id);
-        await db.setSetting('introVideoType', 'animation');
-        await bot.sendMessage(chatId, '✅ Intro animation saved (animation.file_id).');
-        delete awaitingIntroUpload[uid];
-        return;
-      }
-      if (m.document) {
-        await db.setSetting('introVideo', m.document.file_id);
-        await db.setSetting('introVideoType', 'document');
-        await bot.sendMessage(chatId, '✅ Intro saved as document (document.file_id).');
-        delete awaitingIntroUpload[uid];
-        return;
-      }
-      if (m.photo) {
-        // Accept first photo as intro document (optional)
-        const photo = m.photo[m.photo.length - 1];
-        await db.setSetting('introVideo', photo.file_id);
-        await db.setSetting('introVideoType', 'photo');
-        await bot.sendMessage(chatId, '✅ Intro saved as photo.');
-        delete awaitingIntroUpload[uid];
-        return;
-      }
-      if (m.text && m.text.trim()) {
-        const t = m.text.trim();
-        if (/^https?:\/\//i.test(t)) {
-          const type = (/\.(mp4|webm|mov|mkv|gif)(\?.*)?$/i.test(t)) ? 'url_media' : 'url_page';
-          await db.setSetting('introVideo', t);
-          await db.setSetting('introVideoType', type);
-          await bot.sendMessage(chatId, `✅ Intro saved as URL (type: ${type}).`);
-        } else {
-          // treat as file_id or raw file id text
-          await db.setSetting('introVideo', t);
-          await db.setSetting('introVideoType', 'file_id');
-          await bot.sendMessage(chatId, '✅ Intro saved as file_id/text.');
+    if (updateActivity) {
+      // Update streak
+      const today = new Date().toISOString().split('T')[0];
+      const lastActivityDate = user.last_activity_date;
+      
+      if (lastActivityDate) {
+        const lastDate = new Date(lastActivityDate);
+        const todayDate = new Date(today);
+        const daysDiff = Math.floor((todayDate - lastDate) / (1000 * 60 * 60 * 24));
+        
+        if (daysDiff === 1) {
+          // Consecutive day
+          updates.current_streak = (user.current_streak || 0) + 1;
+          updates.longest_streak = Math.max(updates.current_streak, user.longest_streak || 0);
+        } else if (daysDiff > 1) {
+          // Streak broken
+          updates.current_streak = 1;
         }
-        delete awaitingIntroUpload[uid];
-        return;
-      }
-
-      await bot.sendMessage(chatId, '❌ Unsupported message. Please send a video, animation (GIF), document, photo, or paste a file_id/URL. Send /cancelintro to abort.');
-    } catch (err) {
-      console.error('Error saving intro media:', err && (err.response?.body || err.message || err));
-      await bot.sendMessage(chatId, '❌ Failed to save intro. Check server logs for details.');
-      delete awaitingIntroUpload[uid];
-    }
-    return; // important: if we were in intro flow, we handled the message
-  }
-
-  // Disable menu buttons in admin group - only commands work
-  if (isAdminGroup && text && !text.startsWith('/')) {
-    // Check if it's a menu button
-    const menuButtons = ["➡️ Continue", "🎯 Task", "🎁 Bonus", "💼 Trade", "💳 Set Wallet", 
-                        "👥 Referral", "💰 Balance", "💸 Withdrawal", "ℹ️ About Us", "💬 Support", "📊 Stats"];
-    if (menuButtons.includes(text)) {
-      await bot.sendMessage(chatId, '⚠️ Menu buttons are disabled in this group. Please use commands instead.');
-      return;
-    }
-  }
-
-  // If the message is a reply-triggering UI button (➡️ Continue)
-  if (text === "➡️ Continue") {
-    const ch = VERIFY_CHANNELS;
-    const inlineKeyboard = [
-      [{ text: ch[0], url: ch[0].startsWith("http") ? ch[0] : `https://t.me/${ch[0].replace(/^@/, '')}` }],
-      [
-        { text: ch[1], url: ch[1].startsWith("http") ? ch[1] : `https://t.me/${ch[1].replace(/^@/, '')}` },
-        { text: ch[2], url: ch[2].startsWith("http") ? ch[2] : `https://t.me/${ch[2].replace(/^@/, '')}` }
-      ],
-      [
-        { text: ch[3], url: ch[3].startsWith("http") ? ch[3] : `https://t.me/${ch[3].replace(/^@/, '')}` },
-        { text: ch[4], url: ch[4].startsWith("http") ? ch[4] : `https://t.me/${ch[4].replace(/^@/, '')}` }
-      ],
-
-      [{ text: "✅ Verify", callback_data: "verify_now" }]
-    ];
-    await bot.sendMessage(chatId, "📢 Please join all the channels below, then press Verify.", {
-      reply_markup: { inline_keyboard: inlineKeyboard }
-    });
-    return;
-  }
-
-  if (text === "🎯 Task") {
-    await handleTask(chatId, uid);
-    return;
-  }
-  if (text === "🎁 Bonus") {
-    await handleBonus(chatId, uid);
-    return;
-  }
-  if (text === "💼 Trade") {
-    await bot.sendMessage(chatId, "💼 Trade feature coming soon!");
-    return;
-  }
-  if (text === "💳 Set Wallet") {
-    await handleSetWallet(chatId, uid);
-    return;
-  }
-  if (text === "👥 Referral") {
-    await handleReferral(chatId, uid);
-    return;
-  }
-  if (text === "💰 Balance") {
-    await handleBalance(chatId, uid);
-    return;
-  }
-  if (text === "💸 Withdrawal") {
-    await handleWithdrawalMenu(chatId, uid);
-    return;
-  }
-  if (text === "ℹ️ About Us") {
-    await bot.sendMessage(chatId, "About Us", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Open About Us", url: ABOUT_US_URL }]]
-      }
-    });
-    return;
-  }
-  if (text === "💬 Support") {
-    const supportLink = SUPPORT_URL.startsWith("http") ? SUPPORT_URL : `https://t.me/${SUPPORT_URL.replace(/^@/, '')}`;
-    await bot.sendMessage(chatId, "Support", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Open Support", url: supportLink }]]
-      }
-    });
-    return;
-  }
-  if (text === "📊 Stats") {
-    await handleStats(chatId);
-    return;
-  }
-
-  if (awaitingWallet[uid]) {
-    const addr = text.trim();
-    await db.updateUser(uid, { wallet: addr });
-    delete awaitingWallet[uid];
-    await bot.sendMessage(chatId, `✅ Wallet saved: ${addr}`);
-    return;
-  }
-
-  if (pendingTasks[uid]) {
-    if (m.photo) {
-      const photo = m.photo[m.photo.length - 1];
-      pendingTasks[uid].files.push(photo.file_id);
-      const imageCount = pendingTasks[uid].files.length;
-      await bot.sendMessage(chatId, `✅ Image ${imageCount} received. Send more images or press Done when finished.`, {
-        reply_markup: {
-          inline_keyboard: [[{ text: "Done", callback_data: "finish_task_submit" }]]
-        }
-      });
-      return;
-    }
-    if (text && text !== "Done") {
-      pendingTasks[uid].text += "\n" + text;
-      await bot.sendMessage(chatId, "✅ Description saved. Send more or press Done.");
-      return;
-    }
-  }
-});
-
-/* ---------- /start handler (only one) ---------- */
-bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const username = msg.from.username || "";
-  const startParam = match[1];
-
-  console.log(`/start triggered by ${userId}. param: ${startParam || '<none>'}`);
-
-  try {
-    await db.ensureUser(userId, username);
-
-    if (startParam && startParam !== String(userId)) {
-      const user = await db.getUser(userId);
-      if (!user.referred_by) {
-        await db.updateUser(userId, { referred_by: startParam });
-      }
-    }
-
-    const localWelcomePath = path.join(__dirname, 'project-justice', 'intro.mp4');
-
-    const welcomeTextRaw = `
-<b>Hey there, ${msg.from.first_name || ''}</b> 👋
-
-Welcome to the <b>Justice on Solana</b> community ⚖️
-
-We’re redefining fairness in crypto and Web3 🌐✨  
-This isn’t just a project — it’s a <b>movement 🚀</b> for accountability ✅, protection 🛡️, and transparency 🔍 through smart contracts and community governance 🤝
-
-As a member, you’ll:  
-• 🪙 Get updates on milestones and drops  
-• 🧠 Discuss blockchain law & DeFi safety  
-• 🤝 Connect with advocates and builders  
-• 🧩 Help shape decentralized justice on Solana  
-
-Your voice matters here.  
-Together we build a <b>fairer, safer Web3 🔐✨</b>
-
-<b>On-chain justice is unstoppable ♾️⚖️</b>  
-<i>#JusticeOnSolana #Solana #Web3 #CryptoLaw</i>
-`;
-
-    const welcomeText = sanitizeHtmlForTelegram(welcomeTextRaw);
-
-    const keyboard = {
-      keyboard: [["➡️ Continue"]],
-      resize_keyboard: true,
-      one_time_keyboard: true
-    };
-
-    try {
-      const savedIntro = await db.getSetting('introVideo');
-      const savedType = await db.getSetting('introVideoType');
-
-      if (savedIntro) {
-        if (savedType === 'document') {
-          try {
-            await bot.sendDocument(chatId, savedIntro, {
-              caption: welcomeText,
-              parse_mode: 'HTML',
-              reply_markup: keyboard
-            });
-          } catch (err) {
-            console.warn('sendDocument failed, falling back:', err && (err.response?.body || err.message || err));
-            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
-          }
-        } else if (savedType === 'animation') {
-          try {
-            await bot.sendAnimation(chatId, savedIntro, {
-              caption: welcomeText,
-              parse_mode: 'HTML',
-              reply_markup: keyboard
-            });
-          } catch (err) {
-            console.warn('sendAnimation failed, falling back:', err && (err.response?.body || err.message || err));
-            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
-          }
-        } else if (savedType === 'photo') {
-          try {
-            await bot.sendPhoto(chatId, savedIntro, {
-              caption: welcomeText,
-              parse_mode: 'HTML',
-              reply_markup: keyboard
-            });
-          } catch (err) {
-            console.warn('sendPhoto failed, falling back:', err && (err.response?.body || err.message || err));
-            await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
-          }
-        } else {
-          await trySendVideoOrAnimation(savedIntro, chatId, welcomeText, keyboard);
-        }
+        // Same day, no change to streak
       } else {
-        if (fs.existsSync(localWelcomePath)) {
-          await trySendVideoOrAnimation(localWelcomePath, chatId, welcomeText, keyboard);
-        } else {
-          const defaultUrl = 'https://vimeo.com/1131147244?share=copy&fl=sv&fe=ci';
-          await trySendVideoOrAnimation(defaultUrl, chatId, welcomeText, keyboard);
-        }
+        updates.current_streak = 1;
+        updates.longest_streak = 1;
       }
-    } catch (e) {
-      console.error('Error in /start welcome flow:', e && (e.response?.body || e.message || e));
-      try {
-        await bot.sendMessage(chatId, welcomeText, { parse_mode: 'HTML', reply_markup: keyboard });
-      } catch (err) {
-        console.error('Final fallback sendMessage failed:', err && (err.response?.body || err.message || err));
+      
+      updates.last_activity_date = today;
+      
+      // Update message counts based on context
+      const isGroup = activityContext.chatType === 'group' || activityContext.chatType === 'supergroup';
+      if (isGroup) {
+        updates.group_message_count = (user.group_message_count || 0) + 1;
+      } else {
+        updates.bot_message_count = (user.bot_message_count || 0) + 1;
+      }
+      
+      updates.message_count = (user.message_count || 0) + 1;
+      
+      // Update activity score
+      const hoursSinceRegistration = (Date.now() - user.registered_at) / (1000 * 60 * 60);
+      if (hoursSinceRegistration > 0) {
+        updates.activity_score = updates.message_count / Math.max(hoursSinceRegistration, 0.01);
       }
     }
-  } catch (e) {
-    console.error('Unhandled error in /start handler:', e && (e.response?.body || e.message || e));
-    try {
-      await bot.sendMessage(chatId, '❌ An error occurred while processing /start. Please try again later.');
-    } catch (err) {}
-  }
-});
 
-/* ---------- callback_query handlers ---------- */
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const userId = query.from.id;
-  const data = query.data;
-  const username = query.from.username || '';
-  
-  // Ensure user exists first
+    user = await updateUser(userId, updates);
+  }
+
+  return user;
+}
+
+/* ----------------------- Referral helpers ----------------------- */
+async function addReferral(referrerId, referredId) {
   try {
-    await db.ensureUser(userId, username);
+    await pool.query(
+      'INSERT INTO referrals (referrer_id, referred_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [referrerId, referredId]
+    );
   } catch (error) {
-    console.error('Error ensuring user in callback:', error);
+    console.error('Error adding referral:', error);
   }
-  
-  // Track button clicks
-  try {
-    await db.logActivity(userId, 'button_click', { data, chatId }, chatId, query.message.chat.type);
-    const user = await db.getUser(userId);
-    if (user) {
-      await db.updateUser(userId, {
-        button_click_count: (user.button_click_count || 0) + 1
-      });
-    }
-  } catch (error) {
-    console.error('Error tracking button click:', error);
-  }
-
-  if (data === "verify_now") {
-    const missing = [];
-    for (const ch of CHANNELS_TO_VERIFY) {
-      try {
-        const member = await bot.getChatMember(ch, userId);
-        if (!['member', 'administrator', 'creator'].includes(member.status)) {
-          missing.push(ch);
-        }
-      } catch (e) {
-        missing.push(ch);
-      }
-    }
-
-    if (missing.length > 0) {
-      await bot.answerCallbackQuery(query.id, {
-        text: "Please join all required Telegram channels and try again.",
-        show_alert: true
-      });
-      return;
-    }
-
-    const user = await db.getUser(userId);
-    if (!user.verified) {
-      await db.updateUser(userId, { verified: true });
-      if (user.referred_by) {
-        const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
-        const referrer = await db.getUser(user.referred_by);
-        await db.updateUser(user.referred_by, { balance: parseFloat(referrer.balance) + referralReward });
-        await db.addReferral(user.referred_by, userId);
-        try {
-          await bot.sendMessage(user.referred_by, `🎉 You earned ${referralReward} ${CURRENCY_SYMBOL} for referring a verified user!`);
-        } catch (e) {}
-      }
-    }
-
-    await bot.answerCallbackQuery(query.id, { text: "Verification successful!" });
-    await showMenu(chatId);
-    return;
-  }
-
-  if (data.startsWith("select_task:")) {
-    const taskId = Number(data.split(":")[1]);
-    const task = await db.getTaskById(taskId);
-
-    if (!task) {
-      await bot.answerCallbackQuery(query.id, { text: "Task not found!" });
-      return;
-    }
-
-    pendingTasks[userId] = {
-      files: [],
-      text: "",
-      userId: userId,
-      taskId: taskId,
-      taskTitle: task.title,
-      taskReward: parseFloat(task.reward)
-    };
-
-    await bot.sendMessage(chatId, `📤 Submitting proof for: ${task.title}\n\nReward: ${task.reward} ${CURRENCY_SYMBOL}\n\n📸 Please send at least one screenshot or image as proof.\n\nYou can also add a description. Press Done when finished.`, {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Done", callback_data: "finish_task_submit" }]]
-      }
-    });
-    await bot.answerCallbackQuery(query.id);
-    return;
-  }
-
-  if (data === "finish_task_submit") {
-    const pending = pendingTasks[userId];
-
-    if (!pending || !pending.files || pending.files.length === 0) {
-      await bot.answerCallbackQuery(query.id, {
-        text: "❌ Please send at least one image/screenshot before submitting!",
-        show_alert: true
-      });
-      return;
-    }
-
-    await finishTaskSubmit(userId, chatId);
-    await bot.answerCallbackQuery(query.id, { text: "Submission sent for review." });
-    return;
-  }
-
-  if (data.startsWith("task_confirm:")) {
-    const parts = data.split(":");
-    const targetId = parts[1];
-    const submissionId = parts[2];
-    const messageType = query.message.photo ? 'photo' : 'text';
-    await handleAdminTaskConfirm(userId, targetId, submissionId, query.message.chat.id, query.message.message_id, messageType);
-    await bot.answerCallbackQuery(query.id, { text: "Task approved." });
-    return;
-  }
-
-  if (data.startsWith("task_reject:")) {
-    const parts = data.split(":");
-    const targetId = parts[1];
-    const submissionId = parts[2];
-    const messageType = query.message.photo ? 'photo' : 'text';
-    await handleAdminTaskReject(userId, targetId, submissionId, query.message.chat.id, query.message.message_id, messageType);
-    await bot.answerCallbackQuery(query.id, { text: "Task rejected." });
-    return;
-  }
-
-  if (data.startsWith("withdraw_confirm:")) {
-    const parts = data.split(":");
-    const targetId = parts[1];
-    const amount = Number(parts[2]);
-    await handleAdminWithdrawConfirm(userId, targetId, amount, query.message.chat.id);
-    await bot.answerCallbackQuery(query.id, { text: "Withdrawal approved." });
-    return;
-  }
-
-  if (data.startsWith("withdraw_reject:")) {
-    const parts = data.split(":");
-    const targetId = parts[1];
-    await handleAdminWithdrawReject(userId, targetId, query.message.chat.id);
-    await bot.answerCallbackQuery(query.id, { text: "Withdrawal rejected." });
-    return;
-  }
-});
-
-/* ---------- Remaining command handlers (admin & user commands) ----------
-   These functions are the same as your working implementations and are included verbatim.
-   For brevity they are pasted directly below. You can adjust them if needed.
-*/
-
-/* showMenu, handleTask, handleBonus, handleSetWallet, handleReferral, handleBalance,
-   handleWithdrawalMenu, handleStats, finishTaskSubmit, handleAdminTaskConfirm,
-   handleAdminTaskReject, handleAdminWithdrawConfirm, handleAdminWithdrawReject,
-   /requestwithdraw, /addtask, /deletetask, /listtasks, /setconfig, /getconfig,
-   /broadcast, /userinfo, /addbalance, /removebalance, /approveall, /rejectall,
-   /pendingsubmissions, /openwithdrawal, /closewithdrawal, /stats, /referral,
-   /leaderboard, /aboutus, /support, /bonus, /referralreward
-*/
-
-/* (Below: verbatim implementations from your original working code) */
-
-async function showMenu(chatId) {
-  // Don't show menu in admin group
-  if (chatId === ADMIN_GROUP_ID) {
-    await bot.sendMessage(chatId, "🏠 Use commands to interact with the bot in this group.");
-    return;
-  }
-  
-  const keyboard = {
-    keyboard: [
-      ["🎯 Task", "🎁 Bonus"],
-      ["💼 Trade", "💳 Set Wallet"],
-      ["👥 Referral", "💰 Balance"],
-      ["💸 Withdrawal", "📊 Stats"],
-      ["ℹ️ About Us", "💬 Support"]
-    ],
-    resize_keyboard: true
-  };
-  await bot.sendMessage(chatId, "🏠 Main Menu — Choose an option:", { reply_markup: keyboard });
 }
 
-async function handleTask(chatId, userId) {
-  const completedTaskIds = await db.getUserCompletedTasks(userId);
-  const allTasks = await db.getTasks('active');
-  
-  const availableTasks = allTasks.filter(task => !completedTaskIds.includes(task.id));
-  
-  if (availableTasks.length === 0) {
-    await bot.sendMessage(chatId, "🎯 No tasks available at the moment. You've completed all tasks or check back later!");
-    return;
-  }
-  
-  let text = "🎯 Available Tasks:\n\n";
-  availableTasks.forEach((task, index) => {
-    text += `${index + 1}. ${task.title}\n   ${task.description}\n   Reward: ${task.reward} ${CURRENCY_SYMBOL}\n\n`;
-  });
-  text += "Select a task to complete:";
-  
-  const inlineButtons = availableTasks.map(task => ([{
-    text: `✅ ${task.title}`,
-    callback_data: `select_task:${task.id}`
-  }]));
-  
-  const inlineKeyboard = { inline_keyboard: inlineButtons };
-  await bot.sendMessage(chatId, text, { reply_markup: inlineKeyboard });
+async function getUserReferrals(userId) {
+  const result = await pool.query('SELECT referred_id FROM referrals WHERE referrer_id = $1', [userId]);
+  return result.rows.map(row => row.referred_id);
 }
 
-async function handleBonus(chatId, userId) {
-  const user = await db.getUser(userId);
-  const now = Date.now();
-  const lastClaim = user.last_bonus_claim || 0;
-  const timeSinceLastClaim = now - lastClaim;
-  const twentyFourHours = 24 * 60 * 60 * 1000;
-  
-  if (timeSinceLastClaim < twentyFourHours) {
-    const timeLeft = twentyFourHours - timeSinceLastClaim;
-    const hoursLeft = Math.floor(timeLeft / (60 * 60 * 1000));
-    const minutesLeft = Math.floor((timeLeft % (60 * 60 * 1000)) / (60 * 1000));
-    await bot.sendMessage(chatId, `⏰ Bonus available in ${hoursLeft}h ${minutesLeft}m`);
-    return;
-  }
-  
-  const bonus = parseFloat(await db.getSetting('bonusAmount')) || 3;
-  const newBalance = parseFloat(user.balance) + bonus;
-  
-  await db.updateUser(userId, { 
-    balance: newBalance,
-    last_bonus_claim: now
-  });
-  
-  await bot.sendMessage(chatId, `🎁 Bonus added: ${bonus} ${CURRENCY_SYMBOL}\nCurrent balance: ${newBalance} ${CURRENCY_SYMBOL}\n\nNext bonus in 24 hours!`);
+async function getReferralCount(userId) {
+  const result = await pool.query('SELECT COUNT(*) as count FROM referrals WHERE referrer_id = $1', [userId]);
+  return parseInt(result.rows[0].count);
 }
 
-async function handleSetWallet(chatId, userId) {
-  await bot.sendMessage(chatId, "🔐 Please send your wallet address now.");
-  awaitingWallet[userId] = true;
+/* ----------------------- Task management ----------------------- */
+async function createTask(title, description, reward, createdBy = null) {
+  const result = await pool.query(
+    `INSERT INTO tasks (title, description, reward, created_at, created_by, status)
+     VALUES ($1, $2, $3, $4, $5, 'active')
+     RETURNING *`,
+    [title, description, reward, Date.now(), createdBy]
+  );
+  return result.rows[0];
 }
 
-async function handleReferral(chatId, userId) {
-  const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
-  const refCount = await db.getReferralCount(userId);
-  const link = `https://t.me/${BOT_USERNAME}?start=${userId}`;
-  const earned = refCount * referralReward;
-  
-  await bot.sendMessage(chatId, `👥 Your referral link:\n${link}\n\nReferrals: ${refCount}\nEarned: ${earned} ${CURRENCY_SYMBOL}`);
+async function getTasks(status = 'active') {
+  const result = await pool.query('SELECT * FROM tasks WHERE status = $1 ORDER BY created_at DESC', [status]);
+  return result.rows;
 }
 
-async function handleBalance(chatId, userId) {
-  const user = await db.getUser(userId);
-  await bot.sendMessage(chatId, `${CURRENCY_SYMBOL} Balance: ${user.balance || 0}\nWallet: ${user.wallet || "(not set)"}`);
+async function getTaskById(taskId) {
+  const result = await pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
+  return result.rows[0] || null;
 }
 
-async function handleWithdrawalMenu(chatId, userId) {
-  const withdrawalOpen = (await db.getSetting('withdrawalOpen')) === 'true';
-  
-  if (!withdrawalOpen) {
-    await bot.sendMessage(chatId, "❌ Withdrawals are currently closed.");
-    return;
-  }
-  
-  const minWithdrawal = parseFloat(await db.getSetting('minWithdrawal')) || 50;
-  const maxWithdrawal = parseFloat(await db.getSetting('maxWithdrawal')) || 10000;
-  
-  await bot.sendMessage(chatId, `💸 To request withdrawal send:\n/requestwithdraw <amount>\n\nMin: ${minWithdrawal} ${CURRENCY_SYMBOL}\nMax: ${maxWithdrawal} ${CURRENCY_SYMBOL}`);
+async function deleteTask(taskId) {
+  await pool.query('DELETE FROM tasks WHERE id = $1', [taskId]);
 }
 
-async function handleStats(chatId) {
-  const allUsers = await db.getAllUsers();
-  const totalUsers = allUsers.length;
-  const verifiedUsers = allUsers.filter(u => u.verified).length;
-  const now = Date.now();
-  const onlineUsers = allUsers.filter(u => (now - u.last_seen) < 300000).length;
-  const offlineUsers = totalUsers - onlineUsers;
-
-  const totalBalance = await db.getTotalBalance();
-  
-  // Note: systemHealth referenced here in original code; keep compatibility
-  // Analyze all users for system health
-  let realUsers = 0;
-  let suspiciousUsers = 0;
-  
-  for (const user of allUsers) {
-    const analysis = await db.analyzeReferralPattern(user.id);
-    if (parseFloat(analysis.percentage) >= 50) {
-      realUsers++;
-    } else {
-      suspiciousUsers++;
-    }
-  }
-  
-  const healthPercentage = totalUsers > 0 ? (realUsers / totalUsers) * 100 : 0;
-  let healthScore;
-  if (healthPercentage >= 80) healthScore = '⭐⭐⭐⭐⭐';
-  else if (healthPercentage >= 60) healthScore = '⭐⭐⭐⭐';
-  else if (healthPercentage >= 40) healthScore = '⭐⭐⭐';
-  else if (healthPercentage >= 20) healthScore = '⭐⭐';
-  else healthScore = '⭐';
-
-  const systemHealth = {
-    realUsers,
-    suspiciousUsers,
-    score: healthScore
-  };
-
-  const statsText = `📊 System Statistics\n\n` +
-    `Total Users: ${totalUsers}\n` +
-    `Real Users: ${systemHealth.realUsers}\n` +
-    `Suspicious Users: ${systemHealth.suspiciousUsers}\n` +
-    `Users Online: ${onlineUsers}\n` +
-    `Users Offline: ${offlineUsers}\n` +
-    `Total Balance: ${totalBalance} ${CURRENCY_SYMBOL}\n\n` +
-    `Progress Score: ${systemHealth.score}`;
-  
-  await bot.sendMessage(chatId, statsText);
+/* ----------------------- Completed tasks ----------------------- */
+async function getUserCompletedTasks(userId) {
+  const result = await pool.query('SELECT task_id FROM completed_tasks WHERE user_id = $1', [userId]);
+  return result.rows.map(row => row.task_id);
 }
 
-async function finishTaskSubmit(userId, chatId) {
-  const pending = pendingTasks[userId];
-  if (!pending) {
-    await bot.sendMessage(chatId, "No pending submission. Use 🎯 Task to start.");
+async function markTaskCompleted(clientOrUserId, taskId, reward) {
+  // Accept either client (transaction) or direct call
+  if (typeof clientOrUserId === 'object' && clientOrUserId.query) {
+    const client = clientOrUserId;
+    await client.query(
+      `INSERT INTO completed_tasks (user_id, task_id, completed_at, reward)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, task_id) DO NOTHING`,
+      [clientOrUserId._userId, taskId, Date.now(), reward]
+    );
     return;
   }
 
-  if (!pending.files || pending.files.length === 0) {
-    await bot.sendMessage(chatId, "❌ Error: At least one image/screenshot is required. Please upload an image before submitting.");
-    return;
-  }
-  const userIdentifier = await getUserIdentifier(userId);
+  const userId = clientOrUserId;
+  await pool.query(
+    `INSERT INTO completed_tasks (user_id, task_id, completed_at, reward)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, task_id) DO NOTHING`,
+    [userId, taskId, Date.now(), reward]
+  );
+}
 
-// Get full task details from DB so we can include its original description
-const task = await db.getTaskById(pending.taskId);
-const taskDescription = task?.description || "(no task description)";
-const userDescription = pending.text && pending.text.trim() ? pending.text.trim() : "(no user comment)";
-
-const caption = `📝 <b>New Task Submission</b>
-User: ${userIdentifier}
-Task: <b>${pending.taskTitle || 'Unknown'}</b>
-Reward: ${pending.taskReward || 0} ${CURRENCY_SYMBOL}
-
-<b>Task Description:</b>
-${taskDescription}
-
-<b>User Comment:</b>
-${userDescription}
-
-<b>Images:</b> ${pending.files.length}`;
-
-  const submission = await db.createTaskSubmission(
-    userId,
-    pending.taskId,
-    pending.taskTitle,
-    pending.taskReward,
-    pending.text,
-    pending.files
+/* ----------------------- Submissions & atomic approvals ----------------------- */
+async function createTaskSubmission(userId, taskId, taskTitle, taskReward, description, files) {
+  const result = await pool.query(
+    `INSERT INTO task_submissions (user_id, task_id, task_title, task_reward, description, files, status, submitted_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+     RETURNING *`,
+    [userId, taskId, taskTitle, taskReward, description, JSON.stringify(files), Date.now()]
   );
 
-  const inlineKeyboard = {
-    inline_keyboard: [[
-      { text: "✅ Confirm", callback_data: `task_confirm:${userId}:${submission.id}` },
-      { text: "❌ Reject", callback_data: `task_reject:${userId}:${submission.id}` }
-    ]]
-  };
-
-  if (pending.files.length === 1) {
-    await bot.sendPhoto(TASK_REVIEW_CHANNEL, pending.files[0], { 
-      caption: caption,
-      reply_markup: inlineKeyboard 
-    });
-  } else {
-    const mediaGroup = pending.files.map((fileId, index) => ({
-      type: 'photo',
-      media: fileId,
-      caption: index === 0 ? caption : undefined
-    }));
-    
-    try {
-      await bot.sendMediaGroup(TASK_REVIEW_CHANNEL, mediaGroup);
-      await bot.sendMessage(TASK_REVIEW_CHANNEL, "👆 Review the submission above:", { reply_markup: inlineKeyboard });
-    } catch (e) {
-      await bot.sendPhoto(TASK_REVIEW_CHANNEL, pending.files[0], { 
-        caption: caption,
-        reply_markup: inlineKeyboard 
-      });
-      for (let i = 1; i < pending.files.length; i++) {
-        try {
-          await bot.sendPhoto(TASK_REVIEW_CHANNEL, pending.files[i]);
-        } catch (err) {}
-      }
-    }
-  }
-
-  await bot.sendMessage(chatId, `✅ Your submission has been sent for review.\n\n📸 Images submitted: ${pending.files.length}`);
-  delete pendingTasks[userId];
+  await incrementSetting('tasksSubmitted');
+  return result.rows[0];
 }
 
-async function handleAdminTaskConfirm(adminId, targetId, submissionId, chatId, messageId, messageType) {
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ You are not authorized!");
-    return;
-  }
-
-  const submission = await db.getSubmissionById(submissionId);
-  
-  if (!submission || submission.status !== 'pending') {
-    await sendAutoDeleteMessage(chatId, "❌ Submission not found or already processed.");
-    return;
-  }
-
-  const actualUserId = submission.user_id;
-  const reward = parseFloat(submission.task_reward) || 0;
-  const user = await db.getUser(actualUserId);
-  const newBalance = parseFloat(user.balance) + reward;
-  
-  await db.updateUser(actualUserId, { balance: newBalance });
-  await db.updateSubmissionStatus(submission.id, 'approved', adminId);
-  await db.markTaskCompleted(actualUserId, submission.task_id, reward);
-
-  try {
-    await bot.sendMessage(actualUserId, `✅ Your task has been approved!\nReward: ${reward} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}`);
-  } catch (e) {}
-
-  const userIdentifier = await getUserIdentifier(actualUserId);
-  const approvalText = `✅ Task approved for ${userIdentifier}. Reward: ${reward} ${CURRENCY_SYMBOL}`;
-  
-  try {
-    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
-      chat_id: chatId,
-      message_id: messageId
-    });
-    
-    if (messageType === 'photo') {
-      await bot.editMessageCaption(approvalText, {
-        chat_id: chatId,
-        message_id: messageId
-      });
-    } else {
-      await bot.editMessageText(approvalText, {
-        chat_id: chatId,
-        message_id: messageId
-      });
-    }
-  } catch (e) {
-    console.error('Error editing message:', e.message);
-  }
+async function getSubmissionById(submissionId) {
+  const result = await pool.query('SELECT * FROM task_submissions WHERE id = $1', [submissionId]);
+  return result.rows[0] || null;
 }
 
-async function handleAdminTaskReject(adminId, targetId, submissionId, chatId, messageId, messageType) {
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ You are not authorized!");
-    return;
-  }
-
-  const submission = await db.getSubmissionById(submissionId);
-  
-  if (!submission || submission.status !== 'pending') {
-    await sendAutoDeleteMessage(chatId, "❌ Submission not found or already processed.");
-    return;
-  }
-
-  const actualUserId = submission.user_id;
-  
-  await db.updateSubmissionStatus(submission.id, 'rejected', adminId);
-
-  try {
-    await bot.sendMessage(actualUserId, `❌ Your task submission was rejected. Please try again with better proof.`);
-  } catch (e) {}
-
-  const userIdentifier = await getUserIdentifier(actualUserId);
-  const rejectionText = `❌ Task rejected for ${userIdentifier}.`;
-  
-  try {
-    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
-      chat_id: chatId,
-      message_id: messageId
-    });
-    
-    if (messageType === 'photo') {
-      await bot.editMessageCaption(rejectionText, {
-        chat_id: chatId,
-        message_id: messageId
-      });
-    } else {
-      await bot.editMessageText(rejectionText, {
-        chat_id: chatId,
-        message_id: messageId
-      });
-    }
-  } catch (e) {
-    console.error('Error editing message:', e.message);
-  }
+async function getLatestPendingSubmission(userId) {
+  const result = await pool.query(
+    `SELECT * FROM task_submissions 
+     WHERE user_id = $1 AND status = 'pending'
+     ORDER BY submitted_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
 }
 
-async function handleAdminWithdrawConfirm(adminId, targetId, amount, chatId) {
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ You are not authorized!");
-    return;
-  }
-
-  const withdrawal = await db.getLatestPendingWithdrawal(targetId);
-  
-  if (!withdrawal) {
-    await sendAutoDeleteMessage(chatId, "❌ No pending withdrawal found.");
-    return;
-  }
-
-  await db.updateWithdrawalStatus(withdrawal.id, 'approved', adminId);
-
+// Small helper to run transactional approval (updates submission, user balance, completed_tasks and counters)
+async function approveSubmissionAtomic(submissionId, reviewedBy) {
+  const client = await pool.connect();
   try {
-    await bot.sendMessage(targetId, `✅ Your withdrawal request has been approved!\nAmount: ${amount} ${CURRENCY_SYMBOL}`);
-  } catch (e) {}
+    await client.query('BEGIN');
 
-  const adminIdentifier = await getUserIdentifier(adminId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  await sendAutoDeleteMessage(chatId, `✅ Withdrawal approved for ${userIdentifier}. Amount: ${amount} ${CURRENCY_SYMBOL}`);
-  await logAdmin(`Withdrawal approved by ${adminIdentifier} for ${userIdentifier} - Amount: ${amount}`);
-}
+    const subRes = await client.query('SELECT * FROM task_submissions WHERE id = $1 FOR UPDATE', [submissionId]);
+    const submission = subRes.rows[0];
+    if (!submission) throw new Error('Submission not found');
+    if (submission.status !== 'pending') throw new Error('Submission not pending');
 
-async function handleAdminWithdrawReject(adminId, targetId, chatId) {
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ You are not authorized!");
-    return;
-  }
+    // Lock user row
+    const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [submission.user_id]);
+    const user = userRes.rows[0];
+    if (!user) throw new Error('User not found');
 
-  const withdrawal = await db.getLatestPendingWithdrawal(targetId);
-  
-  if (!withdrawal) {
-    await sendAutoDeleteMessage(chatId, "❌ No pending withdrawal found.");
-    return;
-  }
+    // Update submission status
+    await client.query(
+      `UPDATE task_submissions SET status = 'approved', reviewed_at = $1, reviewed_by = $2 WHERE id = $3`,
+      [Date.now(), reviewedBy, submissionId]
+    );
 
-  await db.updateWithdrawalStatus(withdrawal.id, 'rejected', adminId);
+    // Credit user balance
+    const newBalance = (parseFloat(user.balance) || 0) + parseFloat(submission.task_reward || 0);
+    await client.query('UPDATE users SET balance = $1 WHERE id = $2', [newBalance, user.id]);
 
-  try {
-    await bot.sendMessage(targetId, `❌ Your withdrawal request was rejected.`);
-  } catch (e) {}
+    // Insert into completed_tasks
+    await client.query(
+      `INSERT INTO completed_tasks (user_id, task_id, completed_at, reward)
+       VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, task_id) DO NOTHING`,
+      [user.id, submission.task_id, Date.now(), submission.task_reward]
+    );
 
-  const adminIdentifier = await getUserIdentifier(adminId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  await sendAutoDeleteMessage(chatId, `❌ Withdrawal rejected for ${userIdentifier}.`);
-  await logAdmin(`Withdrawal rejected by ${adminIdentifier} for ${userIdentifier}`);
-}
+    // Increment counters
+    const tasksApproved = await getSetting('tasksApproved');
+    await client.query(
+      `INSERT INTO bot_settings (key, value, updated_at) VALUES ('tasksApproved', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+      [String((parseInt(tasksApproved) || 0) + 1)]
+    );
 
-/* ---------- requestwithdraw and admin commands ---------- */
-bot.onText(/\/requestwithdraw\s+(.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const amountStr = match[1];
-  const amount = parseFloat(amountStr);
+    await client.query('COMMIT');
 
-  if (isNaN(amount) || amount <= 0) {
-    await bot.sendMessage(chatId, "❌ Invalid amount.");
-    return;
-  }
-
-  const withdrawalOpen = (await db.getSetting('withdrawalOpen')) === 'true';
-  
-  if (!withdrawalOpen) {
-    await bot.sendMessage(chatId, "❌ Withdrawals are currently closed.");
-    return;
-  }
-
-  const minWithdrawal = parseFloat(await db.getSetting('minWithdrawal')) || 50;
-  const maxWithdrawal = parseFloat(await db.getSetting('maxWithdrawal')) || 10000;
-
-  if (amount < minWithdrawal || amount > maxWithdrawal) {
-    await bot.sendMessage(chatId, `❌ Amount must be between ${minWithdrawal} and ${maxWithdrawal} ${CURRENCY_SYMBOL}`);
-    return;
-  }
-
-  const user = await db.getUser(userId);
-  
-  if (parseFloat(user.balance) < amount) {
-    await bot.sendMessage(chatId, `❌ Insufficient balance. Your balance: ${user.balance} ${CURRENCY_SYMBOL}`);
-    return;
-  }
-
-  if (!user.wallet) {
-    await bot.sendMessage(chatId, "❌ Please set your wallet address first using 💳 Set Wallet");
-    return;
-  }
-
-  await db.createWithdrawalRequest(userId, amount, user.wallet);
-
-  const userIdentifier = await getUserIdentifier(userId);
-  const msg_text = `💸 New Withdrawal Request\nUser: ${userIdentifier}\nAmount: ${amount} ${CURRENCY_SYMBOL}\nWallet: ${user.wallet}`;
-  
-  const inlineKeyboard = {
-    inline_keyboard: [[
-      { text: "✅ Approve", callback_data: `withdraw_confirm:${userId}:${amount}` },
-      { text: "❌ Reject", callback_data: `withdraw_reject:${userId}` }
-    ]]
-  };
-
-  await bot.sendMessage(WITHDRAW_REVIEW_CHANNEL, msg_text, { reply_markup: inlineKeyboard });
-  await bot.sendMessage(chatId, `✅ Withdrawal request submitted for review.\nAmount: ${amount} ${CURRENCY_SYMBOL}`);
-
-  const newBalance = parseFloat(user.balance) - amount;
-  await db.updateUser(userId, { balance: newBalance });
-});
-
-// ✅ Global system health function
-async function analyzeSystemHealth() {
-  try {
-    const cpuLoad = await si.currentLoad();
-    const mem = await si.mem();
-    const netStats = await si.networkStats();
-
-    const cpu = cpuLoad.currentLoad.toFixed(1);
-    const ramUsed = (mem.active / 1024 / 1024 / 1024).toFixed(2);
-    const ramTotal = (mem.total / 1024 / 1024 / 1024).toFixed(2);
-    const netIn = (netStats[0].rx_sec / 1024).toFixed(1);
-    const netOut = (netStats[0].tx_sec / 1024).toFixed(1);
-    const uptime = (process.uptime() / 60).toFixed(1);
-
-    const heart = cpu < 50 ? "💚" : cpu < 80 ? "💛" : "❤️‍🔥";
-
-    return `
-⚙️ *System Health Report* ${heart}
-
-🧠 *CPU Load:* ${cpu}%
-💾 *Memory:* ${ramUsed}GB / ${ramTotal}GB
-🌐 *Network:* ${netIn}KB/s ⬇️ | ${netOut}KB/s ⬆️
-⏱️ *Uptime:* ${uptime} minutes
-🚦 *Status:* ${heart} ${cpu < 80 ? "Stable" : "High Load"}
-    `;
+    return { success: true, userId: user.id, newBalance };
   } catch (err) {
-    console.error("System health check failed:", err);
-    return "❌ Failed to analyze system health.";
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-
-bot.onText(/\/health/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id; // ✅ This is your actual Telegram ID
-
-  // ✅ Proper admin check using your ADMIN_IDS array
-  if (!isAdminId(userId)) {
-    return bot.sendMessage(chatId, "🚫 Access denied. Admins only.");
-  }
-
+async function rejectSubmissionAtomic(submissionId, reviewedBy) {
+  const client = await pool.connect();
   try {
-    const healthReport = await analyzeSystemHealth();
-    await bot.sendMessage(chatId, healthReport, { parse_mode: "Markdown" });
+    await client.query('BEGIN');
+
+    const subRes = await client.query('SELECT * FROM task_submissions WHERE id = $1 FOR UPDATE', [submissionId]);
+    const submission = subRes.rows[0];
+    if (!submission) throw new Error('Submission not found');
+    if (submission.status !== 'pending') throw new Error('Submission not pending');
+
+    await client.query(
+      `UPDATE task_submissions SET status = 'rejected', reviewed_at = $1, reviewed_by = $2 WHERE id = $3`,
+      [Date.now(), reviewedBy, submissionId]
+    );
+
+    // Increment tasksRejected
+    const tasksRejected = await getSetting('tasksRejected');
+    await client.query(
+      `INSERT INTO bot_settings (key, value, updated_at) VALUES ('tasksRejected', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+      [String((parseInt(tasksRejected) || 0) + 1)]
+    );
+
+    await client.query('COMMIT');
+    return { success: true };
   } catch (err) {
-    console.error("Health command error:", err);
-    await bot.sendMessage(chatId, "❌ Failed to fetch system health.");
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
-});
+}
 
+/* ----------------------- Bulk approve/reject helpers ----------------------- */
+async function approveAllPendingSubmissions(reviewedBy) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-bot.onText(/\/addtask (.+) \| (.+) \| (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
+    const pending = await client.query("SELECT * FROM task_submissions WHERE status = 'pending' FOR UPDATE");
+    const rows = pending.rows;
+    let approvedCount = 0;
 
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
+    for (const submission of rows) {
+      // lock user
+      const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [submission.user_id]);
+      const user = userRes.rows[0];
+      if (!user) continue;
 
-  const title = match[1].trim();
-  const description = match[2].trim();
-  const reward = parseFloat(match[3]);
+      // update submission
+      await client.query(
+        `UPDATE task_submissions SET status = 'approved', reviewed_at = $1, reviewed_by = $2 WHERE id = $3`,
+        [Date.now(), reviewedBy, submission.id]
+      );
 
-  if (!title || !description || isNaN(reward)) {
-    await bot.sendMessage(chatId, "❌ Usage: /addtask Title | Description | Reward");
-    return;
-  }
+      // credit balance
+      const newBalance = (parseFloat(user.balance) || 0) + parseFloat(submission.task_reward || 0);
+      await client.query('UPDATE users SET balance = $1 WHERE id = $2', [newBalance, user.id]);
 
-  const task = await db.createTask(title, description, reward, userId);
-  await bot.sendMessage(chatId, `✅ Task created:\n${title}\nReward: ${reward} ${CURRENCY_SYMBOL}`);
-  await logAdmin(`New task created: ${title} - Reward: ${reward}`);
-});
+      // mark completed
+      await client.query(
+        `INSERT INTO completed_tasks (user_id, task_id, completed_at, reward)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, task_id) DO NOTHING`,
+        [user.id, submission.task_id, Date.now(), submission.task_reward]
+      );
 
-bot.onText(/\/deletetask\s+(\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const taskId = Number(match[1]);
-  await db.deleteTask(taskId);
-  await bot.sendMessage(chatId, `✅ Task ${taskId} deleted.`);
-  await logAdmin(`Task ${taskId} deleted`);
-});
-
-bot.onText(/\/listtasks/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const tasks = await db.getTasks('active');
-  
-  if (tasks.length === 0) {
-    await bot.sendMessage(chatId, "No active tasks.");
-    return;
-  }
-
-  let text = "📋 Active Tasks:\n\n";
-  tasks.forEach(task => {
-    text += `ID: ${task.id}\nTitle: ${task.title}\nDescription: ${task.description}\nReward: ${task.reward} ${CURRENCY_SYMBOL}\n\n`;
-  });
-  
-  await bot.sendMessage(chatId, text);
-});
-
-bot.onText(/\/setconfig\s+(\w+)\s+(.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const key = match[1];
-  const value = match[2];
-
-  await db.setSetting(key, value);
-  await bot.sendMessage(chatId, `✅ Config updated: ${key} = ${value}`);
-  await logAdmin(`Config updated: ${key} = ${value}`);
-});
-
-bot.onText(/\/getconfig\s+(\w+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const key = match[1];
-  const value = await db.getSetting(key);
-  
-  await bot.sendMessage(chatId, `⚙️ ${key} = ${value || '(not set)'}`);
-});
-
-bot.onText(/\/broadcast (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-
-  const message = match[1];
-  const users = await db.getAllUsers();
-  
-  let successCount = 0;
-  let failCount = 0;
-
-  for (const user of users) {
-    try {
-      await bot.sendMessage(user.id, message);
-      successCount++;
-    } catch (e) {
-      failCount++;
+      approvedCount++;
     }
+
+    // increment tasksApproved by approvedCount
+    const tasksApproved = await getSetting('tasksApproved');
+    await client.query(
+      `INSERT INTO bot_settings (key, value, updated_at) VALUES ('tasksApproved', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+      [String((parseInt(tasksApproved) || 0) + approvedCount)]
+    );
+
+    await client.query('COMMIT');
+    return { approvedCount };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function rejectAllPendingSubmissions(reviewedBy) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const pending = await client.query("SELECT * FROM task_submissions WHERE status = 'pending' FOR UPDATE");
+    const rows = pending.rows;
+    let rejectedCount = 0;
+
+    for (const submission of rows) {
+      await client.query(
+        `UPDATE task_submissions SET status = 'rejected', reviewed_at = $1, reviewed_by = $2 WHERE id = $3`,
+        [Date.now(), reviewedBy, submission.id]
+      );
+      rejectedCount++;
+    }
+
+    const tasksRejected = await getSetting('tasksRejected');
+    await client.query(
+      `INSERT INTO bot_settings (key, value, updated_at) VALUES ('tasksRejected', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+      [String((parseInt(tasksRejected) || 0) + rejectedCount)]
+    );
+
+    await client.query('COMMIT');
+    return { rejectedCount };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/* ----------------------- Settings ----------------------- */
+async function getSetting(key) {
+  const result = await pool.query('SELECT value FROM bot_settings WHERE key = $1', [key]);
+  return result.rows[0]?.value || null;
+}
+
+async function setSetting(key, value) {
+  await pool.query(
+    `INSERT INTO bot_settings (key, value, updated_at)
+     VALUES ($1, $2, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+    [key, String(value)]
+  );
+}
+
+async function incrementSetting(key, increment = 1) {
+  const current = await getSetting(key);
+  const newValue = (parseInt(current) || 0) + increment;
+  await setSetting(key, newValue);
+  return newValue;
+}
+
+/* ----------------------- Users list & analytics ----------------------- */
+async function getAllUsers() {
+  const result = await pool.query('SELECT * FROM users ORDER BY registered_at DESC');
+  return result.rows;
+}
+
+async function getVerifiedUsers() {
+  const result = await pool.query('SELECT * FROM users WHERE verified = TRUE');
+  return result.rows;
+}
+
+async function getTotalBalance() {
+  const result = await pool.query('SELECT SUM(balance) as total FROM users');
+  return parseFloat(result.rows[0].total) || 0;
+}
+
+/* ----------------------- Withdrawals ----------------------- */
+async function createWithdrawalRequest(userId, amount, wallet) {
+  const result = await pool.query(
+    `INSERT INTO withdrawal_requests (user_id, amount, wallet, status, requested_at)
+     VALUES ($1, $2, $3, 'pending', $4)
+     RETURNING *`,
+    [userId, amount, wallet, Date.now()]
+  );
+  return result.rows[0];
+}
+
+async function getLatestPendingWithdrawal(userId) {
+  const result = await pool.query(
+    `SELECT * FROM withdrawal_requests 
+     WHERE user_id = $1 AND status = 'pending'
+     ORDER BY requested_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+async function updateWithdrawalStatus(withdrawalId, status, reviewedBy = null) {
+  const result = await pool.query(
+    `UPDATE withdrawal_requests 
+     SET status = $1, reviewed_at = $2, reviewed_by = $3
+     WHERE id = $4
+     RETURNING *`,
+    [status, Date.now(), reviewedBy, withdrawalId]
+  );
+  return result.rows[0];
+}
+
+/* ----------------------- Blacklist ----------------------- */
+async function blacklistUser(userId, reason, blacklistedBy) {
+  const result = await pool.query(
+    `INSERT INTO blacklist (user_id, reason, blacklisted_by, blacklisted_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id) DO UPDATE SET 
+       reason = EXCLUDED.reason,
+       blacklisted_by = EXCLUDED.blacklisted_by,
+       blacklisted_at = EXCLUDED.blacklisted_at
+     RETURNING *`,
+    [userId, reason, blacklistedBy, Date.now()]
+  );
+  return result.rows[0];
+}
+
+async function unblacklistUser(userId) {
+  await pool.query('DELETE FROM blacklist WHERE user_id = $1', [userId]);
+}
+
+async function isUserBlacklisted(userId) {
+  const result = await pool.query('SELECT * FROM blacklist WHERE user_id = $1', [userId]);
+  return result.rows[0] || null;
+}
+
+async function getAllBlacklistedUsers() {
+  const result = await pool.query('SELECT * FROM blacklist ORDER BY blacklisted_at DESC');
+  return result.rows;
+}
+
+/* ----------------------- Referral analysis (fraud detection) ----------------------- */
+async function analyzeReferralPattern(userId) {
+  const referrals = await getUserReferrals(userId);
+
+  if (referrals.length === 0) {
+    return { realRefs: 0, suspiciousRefs: 0, score: '⭐⭐⭐⭐⭐', percentage: 100 };
   }
 
-  await bot.sendMessage(chatId, `📢 Broadcast complete:\n✅ Sent: ${successCount}\n❌ Failed: ${failCount}`);
-  await logAdmin(`Broadcast sent to ${successCount} users`);
-});
+  let realCount = 0;
+  let suspiciousCount = 0;
 
-bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  for (const refId of referrals) {
+    const refUser = await getUser(refId);
+    if (!refUser) {
+      suspiciousCount++;
+      continue;
+    }
 
-  if (!isAdminId(userId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+    const messageCount = refUser.message_count || 0;
+    const activityScore = refUser.activity_score || 0;
+    const hasWallet = refUser.wallet && refUser.wallet.length > 0;
+    const isVerified = refUser.verified;
+    const accountAge = Date.now() - refUser.registered_at;
+    const hoursSinceRegistration = accountAge / (1000 * 60 * 60);
+
+    let score = 0;
+    if (messageCount >= 10) score += 3;
+    else if (messageCount >= 5) score += 2;
+    else if (messageCount >= 1) score += 1;
+
+    if (activityScore > 0.5) score += 2;
+    else if (activityScore > 0.1) score += 1;
+
+    if (hasWallet) score += 2;
+    if (isVerified) score += 2;
+    if (hoursSinceRegistration > 24) score += 2;
+    else if (hoursSinceRegistration > 1) score += 1;
+
+    const completedTasks = await getUserCompletedTasks(refId);
+    if (completedTasks.length > 0) score += 2;
+
+    if (score >= 5) realCount++;
+    else suspiciousCount++;
   }
 
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
+  const totalRefs = referrals.length;
+  const realPercentage = totalRefs > 0 ? (realCount / totalRefs) * 100 : 0;
 
-  if (!targetId) {
-    await bot.sendMessage(chatId, "❌ User not found.");
-    return;
-  }
+  let rating;
+  if (realPercentage >= 80) rating = '⭐⭐⭐⭐⭐';
+  else if (realPercentage >= 60) rating = '⭐⭐⭐⭐';
+  else if (realPercentage >= 40) rating = '⭐⭐⭐';
+  else if (realPercentage >= 20) rating = '⭐⭐';
+  else rating = '⭐';
 
-  const user = await db.getUser(targetId);
-  if (!user) {
-    await bot.sendMessage(chatId, "❌ User not found.");
-    return;
-  }
+  return {
+    realRefs: realCount,
+    suspiciousRefs: suspiciousCount,
+    score: rating,
+    percentage: realPercentage.toFixed(1)
+  };
+}
 
-  const refCount = await db.getReferralCount(targetId);
-  const completedTasks = await db.getUserCompletedTasks(targetId);
-  const refAnalysis = await db.analyzeReferralPattern(targetId);
-  const withdrawalStats = await db.getUserWithdrawalStats(targetId);
-  const referralDetails = await db.getDetailedReferralAnalysis(targetId);
-  const referrerInfo = await db.getReferrerInfo(targetId);
-  const botDetection = await db.detectBotOrFakeUser(targetId);
+/**
+ * Get detailed analysis of each referral with classification and scoring
+ */
+async function getDetailedReferralAnalysis(userId) {
+  const referrals = await getUserReferrals(userId);
+  const details = [];
 
-  const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
-  const totalReferralEarnings = refAnalysis.realRefs * referralReward;
+  for (const refId of referrals) {
+    const refUser = await getUser(refId);
+    
+    if (!refUser) {
+      details.push({
+        userId: refId,
+        username: null,
+        balance: 0,
+        wallet: null,
+        classification: 'Deleted User',
+        statusEmoji: '❌',
+        scoreStars: '❌',
+        totalScore: 0,
+        messageCount: 0,
+        completedTasks: 0,
+        activityScore: 0,
+        accountAge: 'Unknown',
+        verified: false,
+        hasWallet: false,
+        referralCount: 0,
+        totalWithdrawn: 0,
+        pendingWithdrawals: 0,
+        lastSeen: 'Never',
+        isFake: true
+      });
+      continue;
+    }
 
-  let info = `👤 <b>User Information</b>\n\n`;
+    const messageCount = refUser.message_count || 0;
+    const activityScore = refUser.activity_score || 0;
+    const hasWallet = refUser.wallet && refUser.wallet.length > 0;
+    const isVerified = refUser.verified;
+    const hasUsername = refUser.username && refUser.username.length > 0;
+    const accountAge = Date.now() - refUser.registered_at;
+    const hoursSinceRegistration = accountAge / (1000 * 60 * 60);
+    const daysSinceRegistration = accountAge / (1000 * 60 * 60 * 24);
 
-  // ━━━━━ BASIC INFO ━━━━━
-  info += `<b>━━━━━ Basic Info ━━━━━</b>\n`;
-  info += `├ ID: <code>${user.id}</code>\n`;
-  info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
-  if (referrerInfo) {
-    info += `├ Invited By: ${referrerInfo.username ? '@' + referrerInfo.username : referrerInfo.id}\n`;
-  }
+    // Get additional user stats
+    const completedTasks = await getUserCompletedTasks(refId);
+    const referralCount = await getReferralCount(refId);
+    const withdrawalStats = await getUserWithdrawalStats(refId);
+    
+    // Calculate detailed score (max 15 points)
+    let score = 0;
+    
+    // Message activity (0-3 points)
+    if (messageCount >= 10) score += 3;
+    else if (messageCount >= 5) score += 2;
+    else if (messageCount >= 1) score += 1;
 
-  const balance = parseFloat(user.balance) || 0;
-  info += `├ Balance: <b>${balance.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
-  info += `├ Wallet: <code>${user.wallet || '(not set)'}</code>\n`;
-  info += `├ Verified: ${user.verified ? '✅ Yes' : '❌ No'}\n`;
-  info += `└ Registered: ${
-    user.registered_at ? new Date(user.registered_at).toLocaleString() : 'N/A'
-  }\n\n`;
+    // Activity score (0-2 points)
+    if (activityScore > 0.5) score += 2;
+    else if (activityScore > 0.1) score += 1;
 
-  // ━━━━━ ACTIVITY STATS ━━━━━
-  info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
-  info += `├ Messages Sent: ${user.message_count || 0}\n`;
-  info += `├ Group Messages: ${user.group_message_count || 0}\n`;
-  info += `├ Bot Messages: ${user.bot_message_count || 0}\n`;
-  info += `├ Commands Used: ${user.command_count || 0}\n`;
-  info += `├ Button Clicks: ${user.button_click_count || 0}\n`;
+    // Wallet set (0-2 points)
+    if (hasWallet) score += 2;
 
-  const activityScore = parseFloat(user.activity_score);
-  info += `├ Activity Score: ${
-    !isNaN(activityScore) ? activityScore.toFixed(2) : '0.00'
-  }\n`;
-  info += `├ Completed Tasks: ${completedTasks?.length || 0}\n`;
-  info += `├ Current Streak: ${user.current_streak || 0} days 🔥\n`;
-  info += `├ Longest Streak: ${user.longest_streak || 0} days 🏆\n`;
-  info += `├ Engagement Tier: ${user.engagement_tier || 'Regular'}\n`;
+    // Verified status (0-2 points)
+    if (isVerified) score += 2;
 
-  let lastSeenStr = 'N/A';
-  if (user.last_seen) {
-    const timeSinceLastSeen = Date.now() - user.last_seen;
+    // Account age (0-2 points)
+    if (hoursSinceRegistration > 24) score += 2;
+    else if (hoursSinceRegistration > 1) score += 1;
+
+    // Completed tasks (0-2 points)
+    if (completedTasks.length > 0) score += 2;
+    
+    // Has username (0-2 points) - NEW
+    if (hasUsername) score += 2;
+
+    // Determine classification and emoji with enhanced fake detection
+    let classification, statusEmoji, scoreStars;
+    
+    // ENHANCED fake detection logic - automatically flag users without username
+    const isFake = (
+      !hasUsername || // Automatically flag if no username
+      (messageCount === 0 && 
+       completedTasks.length === 0 && 
+       !isVerified && 
+       !hasWallet && 
+       hoursSinceRegistration < 1 &&
+       referralCount === 0)
+    );
+    
+    const isLikelyBot = (
+      !isFake &&
+      messageCount === 0 && 
+      completedTasks.length === 0 && 
+      hoursSinceRegistration < 24 &&
+      !isVerified
+    );
+    
+    if (isFake) {
+      classification = 'Fake';
+      statusEmoji = '🚫';
+      scoreStars = '❌';
+    } else if (score >= 10) {
+      classification = 'Real User';
+      statusEmoji = '✅';
+      scoreStars = '⭐⭐⭐⭐⭐';
+    } else if (score >= 7) {
+      classification = 'Real User';
+      statusEmoji = '✅';
+      scoreStars = '⭐⭐⭐⭐';
+    } else if (score >= 4) {
+      classification = 'Suspicious';
+      statusEmoji = '⚠️';
+      scoreStars = '⭐⭐⭐';
+    } else if (isLikelyBot) {
+      classification = 'Likely Bot';
+      statusEmoji = '🤖';
+      scoreStars = '⭐';
+    } else {
+      classification = 'Suspicious';
+      statusEmoji = '⚠️';
+      scoreStars = '⭐⭐';
+    }
+
+    // Format account age
+    let ageString;
+    if (daysSinceRegistration >= 1) {
+      ageString = `${Math.floor(daysSinceRegistration)}d`;
+    } else if (hoursSinceRegistration >= 1) {
+      ageString = `${Math.floor(hoursSinceRegistration)}h`;
+    } else {
+      ageString = `${Math.floor(hoursSinceRegistration * 60)}m`;
+    }
+
+    // Format last seen
+    const timeSinceLastSeen = Date.now() - refUser.last_seen;
     const hoursSinceLastSeen = timeSinceLastSeen / (1000 * 60 * 60);
-    lastSeenStr =
-      hoursSinceLastSeen < 1
-        ? `${Math.floor(hoursSinceLastSeen * 60)}m ago`
-        : hoursSinceLastSeen < 24
-        ? `${Math.floor(hoursSinceLastSeen)}h ago`
-        : `${Math.floor(hoursSinceLastSeen / 24)}d ago`;
-  }
-  info += `└ Last Seen: ${lastSeenStr}\n\n`;
-  
-  // ━━━━━ BOT/FAKE DETECTION ━━━━━
-  info += `<b>━━━━━ Detection Analysis ━━━━━</b>\n`;
-  info += `├ Classification: ${botDetection.classification}\n`;
-  info += `├ Bot Score: ${botDetection.botScore}/100\n`;
-  info += `├ Fake Score: ${botDetection.fakeScore}/100\n`;
-  info += `├ Confidence: ${botDetection.confidence}%\n`;
-  info += `├ Spam Score: ${user.spam_score || 0}\n`;
-  info += `├ Is Throttled: ${user.is_throttled ? 'Yes ⚠️' : 'No ✅'}\n`;
-  if (botDetection.reasons.length > 0) {
-    info += `└ Flags: ${botDetection.reasons.slice(0, 3).join(', ')}\n`;
-  }
-  info += `\n`;
+    const daysSinceLastSeen = timeSinceLastSeen / (1000 * 60 * 60 * 24);
+    
+    let lastSeenString;
+    if (daysSinceLastSeen >= 1) {
+      lastSeenString = `${Math.floor(daysSinceLastSeen)}d ago`;
+    } else if (hoursSinceLastSeen >= 1) {
+      lastSeenString = `${Math.floor(hoursSinceLastSeen)}h ago`;
+    } else {
+      lastSeenString = `${Math.floor(hoursSinceLastSeen * 60)}m ago`;
+    }
 
-  // ━━━━━ WITHDRAWAL STATS ━━━━━
-  info += `<b>━━━━━ Withdrawal Stats ━━━━━</b>\n`;
-  const totalWithdrawn = parseFloat(withdrawalStats.totalWithdrawn) || 0;
-  info += `├ Total Withdrawn: <b>${totalWithdrawn.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
-  info += `├ Approved: ${withdrawalStats.approvedCount || 0}\n`;
-  info += `├ Pending: ${withdrawalStats.pendingCount || 0}\n`;
-  info += `└ Rejected: ${withdrawalStats.rejectedCount || 0}\n\n`;
-
-  // ━━━━━ REFERRAL ANALYSIS ━━━━━
-  info += `<b>━━━━━ Referral Analysis ━━━━━</b>\n`;
-  info += `├ Total Referrals: ${refCount || 0}\n`;
-  info += `├ Real Users: ${refAnalysis?.realRefs || 0} ✅\n`;
-  info += `├ Suspicious: ${refAnalysis?.suspiciousRefs || 0} ⚠️\n`;
-  info += `├ Quality Score: ${parseFloat(refAnalysis?.score) || 0}\n`;
-  info += `├ Quality: ${parseFloat(refAnalysis?.percentage) || 0}%\n`;
-  info += `└ Referral Earnings: <b>${parseFloat(totalReferralEarnings) || 0} ${CURRENCY_SYMBOL}</b>\n\n`;
-
-  // ━━━━━ MINI REFERRAL OVERVIEW ━━━━━
-  if (referralDetails.length > 0) {
-    info += `<b>━━━━━ 👥 Top Referrals ━━━━━</b>\n`;
-
-    // Sort by score descending and show top 3
-    const topRefs = referralDetails
-      .sort((a, b) => (b.totalScore || 0) - (a.totalScore || 0))
-      .slice(0, 3);
-
-    topRefs.forEach((ref, i) => {
-      const stars = '⭐'.repeat(Math.min(5, Math.round(ref.totalScore / 2)));
-      info += `${i + 1}. ${ref.username ? '@' + ref.username : ref.userId} — ${stars} (${ref.totalScore || 0}/13)\n`;
+    details.push({
+      userId: refId,
+      username: refUser.username,
+      balance: parseFloat(refUser.balance) || 0,
+      wallet: refUser.wallet || null,
+      classification,
+      statusEmoji,
+      scoreStars,
+      totalScore: score,
+      messageCount,
+      completedTasks: completedTasks.length,
+      activityScore,
+      accountAge: ageString,
+      verified: isVerified,
+      hasWallet,
+      hasUsername,
+      referralCount,
+      totalWithdrawn: withdrawalStats.totalWithdrawn,
+      pendingWithdrawals: withdrawalStats.pendingCount,
+      lastSeen: lastSeenString,
+      registeredAt: new Date(refUser.registered_at).toLocaleString(),
+      isFake
     });
-
-    // Classification summary
-    const realCount = referralDetails.filter(r => r.classification === 'Real User').length;
-    const suspiciousCount = referralDetails.filter(r => r.classification === 'Suspicious').length;
-    const botCount = referralDetails.filter(r => r.classification === 'Likely Bot').length;
-    const fakeCount = referralDetails.filter(r => r.classification === 'Fake').length;
-
-    info += `\n<b>━━━━━ 📊 Classification Summary ━━━━━</b>\n`;
-    info += `✅ Real: ${realCount} | ⚠️ Suspicious: ${suspiciousCount} | 🤖 Bots: ${botCount} | 🚫 Fake: ${fakeCount}\n\n`;
-  } else {
-    info += `<i>No referrals yet.</i>\n\n`;
   }
 
-  // ━━━━━ FINAL USER RATING ━━━━━
-  const taskPoints = Math.min(completedTasks.length * 0.5, 5);
-  const referralPoints = Math.min(refCount * 0.3, 3);
-  const verifiedPoints = user.verified ? 1.5 : 0;
-  const activityPoints = Math.min(activityScore / 2, 5);
-  const base = 1;
-  const totalScore = base + taskPoints + referralPoints + verifiedPoints + activityPoints;
-  const maxScore = 10;
+  // Sort by score (highest first)
+  details.sort((a, b) => b.totalScore - a.totalScore);
 
-  const starRating = Math.round((totalScore / maxScore) * 5);
-  const starIcons = '⭐'.repeat(starRating) + '☆'.repeat(5 - starRating);
+  return details;
+}
 
-  let ratingLabel = '🟢 Excellent';
-  if (starRating <= 2) ratingLabel = '🔴 Low';
-  else if (starRating === 3) ratingLabel = '🟡 Average';
-
-  info += `<b>━━━━━ ⭐ Overall Rating ━━━━━</b>\n`;
-  info += `User Score: <b>${totalScore.toFixed(1)}/${maxScore}</b>\n`;
-  info += `Rating: ${starIcons} ${ratingLabel}\n`;
-
-  await bot.sendMessage(chatId, info, { parse_mode: 'HTML' });
-});
-
-// =============== Admin Command Wrappers with Auto-Delete ===============
-
-// Blacklist with reason
-bot.onText(/\/blacklist\s+(@?\w+|\d+)(?:\s+(.+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/**
+ * Get withdrawal statistics for a user
+ */
+async function getUserWithdrawalStats(userId) {
+  const result = await pool.query(
+    `SELECT 
+      COALESCE(SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END), 0) as total_withdrawn,
+      COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_count,
+      COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved_count,
+      COUNT(CASE WHEN status = 'rejected' THEN 1 END) as rejected_count
+     FROM withdrawal_requests 
+     WHERE user_id = $1`,
+    [userId]
+  );
   
-  if (!isAdminId(adminId)) return;
-  
-  const input = match[1].trim();
-  const reason = match[2] ? match[2].trim() : "No reason provided";
-  const targetId = await resolveUserInput(input);
-  
-  let actionMsg = `⛔️ /blacklist by admin: ${adminId} on user ${input} (${targetId})`;
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    await broadcastAdminAction(actionMsg + "\nResult: User not found.");
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  if (isAdminId(targetId)) {
-    await sendAndAutoDelete(chatId, "❌ You cannot blacklist another admin.", 30000);
-    await broadcastAdminAction(actionMsg + "\nResult: Cannot blacklist admin.");
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  await db.blacklistUser(targetId, reason, adminId);
-  await sendAndAutoDelete(chatId, `🚫 User ${input} (${targetId}) has been blacklisted.\nReason: ${reason}`, 30000);
-  await broadcastAdminAction(actionMsg + `\nReason: ${reason}\nResult: User blacklisted.`);
-  
-  // Delete admin command after 30 sec
-  deleteMessageLater(chatId, msg.message_id, 30000);
-  
-  // Delete the blacklisted user's most recent message in this chat
-  try {
-    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
-      const userMsgId = global.userLatestMessage[chatId][targetId];
-      deleteMessageLater(chatId, userMsgId, 30000);
-    }
-  } catch (e) {}
-});
-
-// Unblacklist
-bot.onText(/\/unblacklist\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  await db.unblacklistUser(targetId);
-  await sendAndAutoDelete(chatId, `✅ User ${input} (${targetId}) has been removed from blacklist.`, 30000);
-  await broadcastAdminAction(`✅ /unblacklist by admin ${adminId}: User ${input} (${targetId}) removed from blacklist.`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// List blacklisted users
-bot.onText(/\/listblacklist/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const blacklisted = await db.getAllBlacklistedUsers();
-  
-  if (blacklisted.length === 0) {
-    await sendAndAutoDelete(chatId, "📋 No blacklisted users.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  let text = "📋 Blacklisted Users:\n\n";
-  for (const entry of blacklisted) {
-    const userIdentifier = await getUserIdentifier(entry.user_id);
-    text += `User: ${userIdentifier}\nReason: ${entry.reason}\nBlacklisted at: ${new Date(entry.blacklisted_at).toLocaleString()}\n\n`;
-  }
-  
-  await sendAndAutoDelete(chatId, text, 60000);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// Addbalance
-bot.onText(/\/addbalance\s+(@?\w+|\d+)\s+(\d+)(?:\s+(.+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const input = match[1].trim();
-  const amount = parseFloat(match[2]);
-  const reason = match[3] ? match[3].trim() : "No reason provided";
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    await broadcastAdminAction(`❌ /addbalance failed by admin ${adminId}\nTarget: ${input}\nReason: User not found`);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const user = await db.getUser(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  const oldBalance = parseFloat(user.balance) || 0;
-  const newBalance = oldBalance + amount;
-  await db.updateUser(targetId, { balance: newBalance });
-  
-  await sendAndAutoDelete(chatId, `✅ Added ${amount} ${CURRENCY_SYMBOL} to ${userIdentifier}\nOld balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`, 30000);
-  await broadcastAdminAction(`💰 Balance Added\n\nAdmin: ${adminId}\nUser: ${userIdentifier}\nAmount: +${amount} ${CURRENCY_SYMBOL}\nOld Balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew Balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-  
-  // Delete user's last message if exists
-  try {
-    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
-      const userMsgId = global.userLatestMessage[chatId][targetId];
-      deleteMessageLater(chatId, userMsgId, 30000);
-    }
-  } catch (e) {}
-});
-
-// Removebalance
-bot.onText(/\/removebalance\s+(@?\w+|\d+)\s+(\d+)(?:\s+(.+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const input = match[1].trim();
-  const amount = parseFloat(match[2]);
-  const reason = match[3] ? match[3].trim() : "No reason provided";
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    await broadcastAdminAction(`❌ /removebalance failed by admin ${adminId}\nTarget: ${input}\nReason: User not found`);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const user = await db.getUser(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  const oldBalance = parseFloat(user.balance) || 0;
-  const removeAmt = Math.min(amount, oldBalance);
-  const newBalance = oldBalance - removeAmt;
-  await db.updateUser(targetId, { balance: newBalance });
-  
-  await sendAndAutoDelete(chatId, `✅ Removed ${removeAmt} ${CURRENCY_SYMBOL} from ${userIdentifier}\nOld balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`, 30000);
-  await broadcastAdminAction(`💸 Balance Deducted\n\nAdmin: ${adminId}\nUser: ${userIdentifier}\nAmount: -${removeAmt} ${CURRENCY_SYMBOL}\nOld Balance: ${oldBalance} ${CURRENCY_SYMBOL}\nNew Balance: ${newBalance} ${CURRENCY_SYMBOL}\nReason: ${reason}`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-  
-  // Delete user's last message if exists
-  try {
-    if (global.userLatestMessage && global.userLatestMessage[chatId] && global.userLatestMessage[chatId][targetId]) {
-      const userMsgId = global.userLatestMessage[chatId][targetId];
-      deleteMessageLater(chatId, userMsgId, 30000);
-    }
-  } catch (e) {}
-});
-
-// Open withdrawal
-bot.onText(/\/openwithdrawal/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  await db.setSetting('withdrawalOpen', 'true');
-  await sendAndAutoDelete(chatId, '✅ Withdrawals are now OPEN.', 30000);
-  await broadcastAdminAction(`🔓 Withdrawals Opened\n\nAdmin: ${adminId}\nStatus: OPEN`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// Close withdrawal
-bot.onText(/\/closewithdrawal/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  await db.setSetting('withdrawalOpen', 'false');
-  await sendAndAutoDelete(chatId, '✅ Withdrawals are now CLOSED.', 30000);
-  await broadcastAdminAction(`🔒 Withdrawals Closed\n\nAdmin: ${adminId}\nStatus: CLOSED`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// Set min and max withdrawal
-bot.onText(/\/setminandmaxwithdrawal\s+(\d+)\s+(\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const minW = parseFloat(match[1]);
-  const maxW = parseFloat(match[2]);
-  
-  await db.setSetting('minWithdrawal', minW);
-  await db.setSetting('maxWithdrawal', maxW);
-  
-  await sendAndAutoDelete(chatId, `✅ Withdrawal limits updated\nMin: ${minW} ${CURRENCY_SYMBOL}\nMax: ${maxW} ${CURRENCY_SYMBOL}`, 30000);
-  await broadcastAdminAction(`⚙️ Withdrawal Limits Updated\n\nAdmin: ${adminId}\nMin Withdrawal: ${minW} ${CURRENCY_SYMBOL}\nMax Withdrawal: ${maxW} ${CURRENCY_SYMBOL}`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// Set referral reward
-bot.onText(/\/setreferralreward\s+(\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const amt = parseFloat(match[1]);
-  
-  await db.setSetting('referralReward', amt);
-  
-  await sendAndAutoDelete(chatId, `✅ Referral reward updated: ${amt} ${CURRENCY_SYMBOL}`, 30000);
-  await broadcastAdminAction(`👥 Referral Reward Updated\n\nAdmin: ${adminId}\nNew Reward: ${amt} ${CURRENCY_SYMBOL}`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// Set daily bonus reward
-bot.onText(/\/setdailybonusreward\s+(\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) return;
-  
-  const amt = parseFloat(match[1]);
-  
-  await db.setSetting('bonusAmount', amt);
-  
-  await sendAndAutoDelete(chatId, `✅ Daily bonus reward updated: ${amt} ${CURRENCY_SYMBOL}`, 30000);
-  await broadcastAdminAction(`🎁 Daily Bonus Updated\n\nAdmin: ${adminId}\nNew Bonus: ${amt} ${CURRENCY_SYMBOL}`);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// ================= Log last message id per user per chat ================
-bot.on('message', (msg) => {
-  if (!msg.from || msg.from.is_bot) return;
-  global.userLatestMessage[msg.chat.id] = global.userLatestMessage[msg.chat.id] || {};
-  global.userLatestMessage[msg.chat.id][msg.from.id] = msg.message_id;
-});
-
-/* ==================== NEW ADMIN COMMANDS ==================== */
-
-// /activitylog - View user activity history
-bot.onText(/\/activitylog\s+(@?\w+|\d+)(?:\s+(\d+))?/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-  
-  const input = match[1].trim();
-  const limit = match[2] ? parseInt(match[2]) : 20;
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const logs = await db.getUserActivityLogs(targetId, { limit });
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  if (logs.length === 0) {
-    await sendAndAutoDelete(chatId, `📋 No activity logs found for ${userIdentifier}`, 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  let text = `📋 <b>Activity Log for ${userIdentifier}</b>\n\n`;
-  logs.forEach((log, i) => {
-    const date = new Date(log.timestamp).toLocaleString();
-    text += `${i + 1}. ${log.activity_type} - ${date}\n`;
-    if (log.chat_type) text += `   Chat: ${log.chat_type}\n`;
-  });
-  
-  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-// /tiers - Show engagement distribution
-bot.onText(/\/tiers/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-  
-  const distribution = await db.getTierDistribution();
-  
-  let text = `🏆 <b>Engagement Tier Distribution</b>\n\n`;
-  const tierEmojis = {
-    'Elite': '👑',
-    'Active': '⭐',
-    'Regular': '✅',
-    'Dormant': '😴',
-    'Ghost': '👻'
+  return {
+    totalWithdrawn: parseFloat(result.rows[0].total_withdrawn) || 0,
+    pendingCount: parseInt(result.rows[0].pending_count) || 0,
+    approvedCount: parseInt(result.rows[0].approved_count) || 0,
+    rejectedCount: parseInt(result.rows[0].rejected_count) || 0
   };
-  
-  distribution.forEach(tier => {
-    const emoji = tierEmojis[tier.engagement_tier] || '📊';
-    text += `${emoji} ${tier.engagement_tier}: ${tier.count} users\n`;
-  });
-  
-  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+}
 
-// /updatetier - Recalculate user tier
-bot.onText(/\/updatetier\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+/* ----------------------- Activity Logging ----------------------- */
+/**
+ * Log user activity to the activity log table
+ */
+async function logActivity(userId, activityType, activityData = {}, chatId = null, chatType = null) {
+  try {
+    await pool.query(
+      `INSERT INTO user_activity_log (user_id, activity_type, activity_data, chat_id, chat_type, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, activityType, JSON.stringify(activityData), chatId, chatType, Date.now()]
+    );
+  } catch (error) {
+    console.error('Error logging activity:', error);
   }
-  
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const result = await db.updateEngagementTier(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  await sendAndAutoDelete(chatId, `✅ Tier updated for ${userIdentifier}\nNew Tier: ${result.tier}\nScore: ${result.tierScore.toFixed(2)}`, 30000);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+}
 
-// /streak - View streak info
-bot.onText(/\/streak\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/**
+ * Get user activity logs with optional filters
+ */
+async function getUserActivityLogs(userId, options = {}) {
+  const { limit = 100, activityType = null, startTime = null, endTime = null } = options;
   
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+  let query = 'SELECT * FROM user_activity_log WHERE user_id = $1';
+  const params = [userId];
+  let paramCount = 2;
+  
+  if (activityType) {
+    query += ` AND activity_type = $${paramCount}`;
+    params.push(activityType);
+    paramCount++;
   }
   
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
+  if (startTime) {
+    query += ` AND timestamp >= $${paramCount}`;
+    params.push(startTime);
+    paramCount++;
   }
   
-  const user = await db.getUser(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
+  if (endTime) {
+    query += ` AND timestamp <= $${paramCount}`;
+    params.push(endTime);
+    paramCount++;
+  }
   
-  let text = `🔥 <b>Streak Info for ${userIdentifier}</b>\n\n`;
-  text += `Current Streak: ${user.current_streak || 0} days\n`;
-  text += `Longest Streak: ${user.longest_streak || 0} days\n`;
-  text += `Last Activity: ${user.last_activity_date || 'Never'}\n`;
+  query += ` ORDER BY timestamp DESC LIMIT $${paramCount}`;
+  params.push(limit);
   
-  await sendAndAutoDelete(chatId, text, 30000, { parse_mode: 'HTML' });
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+  const result = await pool.query(query, params);
+  return result.rows;
+}
 
-// /spamcheck - Check spam status
-bot.onText(/\/spamcheck\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/**
+ * Get activity statistics for a user
+ */
+async function getUserActivityStats(userId, timeRange = 24 * 60 * 60 * 1000) {
+  const startTime = Date.now() - timeRange;
   
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+  const result = await pool.query(
+    `SELECT 
+      activity_type,
+      COUNT(*) as count,
+      MAX(timestamp) as last_occurrence
+     FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2
+     GROUP BY activity_type`,
+    [userId, startTime]
+  );
+  
+  return result.rows;
+}
+
+/* ----------------------- Spam Detection ----------------------- */
+/**
+ * Check if user is spamming based on recent activity
+ */
+async function checkSpamBehavior(userId) {
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+  const fiveMinutesAgo = now - 300000;
+  
+  // Count messages in last minute
+  const recentResult = await pool.query(
+    `SELECT COUNT(*) as count FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2 AND activity_type IN ('message', 'command')`,
+    [userId, oneMinuteAgo]
+  );
+  
+  const messagesLastMinute = parseInt(recentResult.rows[0].count);
+  
+  // Count messages in last 5 minutes
+  const fiveMinResult = await pool.query(
+    `SELECT COUNT(*) as count FROM user_activity_log
+     WHERE user_id = $1 AND timestamp >= $2 AND activity_type IN ('message', 'command')`,
+    [userId, fiveMinutesAgo]
+  );
+  
+  const messagesLastFiveMin = parseInt(fiveMinResult.rows[0].count);
+  
+  // Spam thresholds
+  const isSpamming = messagesLastMinute > 10 || messagesLastFiveMin > 30;
+  const spamScore = (messagesLastMinute * 2) + (messagesLastFiveMin * 0.5);
+  
+  if (isSpamming) {
+    // Throttle user for 5 minutes
+    await updateUser(userId, {
+      spam_score: spamScore,
+      is_throttled: true,
+      throttled_until: now + 300000,
+      last_spam_check: now
+    });
+  } else {
+    // Decay spam score
+    const user = await getUser(userId);
+    const newSpamScore = Math.max(0, (user.spam_score || 0) - 1);
+    await updateUser(userId, {
+      spam_score: newSpamScore,
+      last_spam_check: now
+    });
   }
   
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
+  return { isSpamming, spamScore, messagesLastMinute, messagesLastFiveMin };
+}
+
+/**
+ * Check if user is currently throttled
+ */
+async function isUserThrottled(userId) {
+  const user = await getUser(userId);
+  if (!user) return false;
   
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const spamCheck = await db.checkSpamBehavior(targetId);
-  const user = await db.getUser(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  let text = `🚨 <b>Spam Check for ${userIdentifier}</b>\n\n`;
-  text += `Is Spamming: ${spamCheck.isSpamming ? '⚠️ Yes' : '✅ No'}\n`;
-  text += `Spam Score: ${spamCheck.spamScore.toFixed(2)}\n`;
-  text += `Messages (1 min): ${spamCheck.messagesLastMinute}\n`;
-  text += `Messages (5 min): ${spamCheck.messagesLastFiveMin}\n`;
-  text += `Is Throttled: ${user.is_throttled ? '⚠️ Yes' : '✅ No'}\n`;
-  
-  if (user.throttled_until) {
-    const timeLeft = user.throttled_until - Date.now();
-    if (timeLeft > 0) {
-      const minutesLeft = Math.floor(timeLeft / 60000);
-      text += `Throttled Until: ${minutesLeft} minutes\n`;
+  if (user.is_throttled && user.throttled_until) {
+    if (Date.now() < user.throttled_until) {
+      return true;
+    } else {
+      // Throttle expired, remove it
+      await updateUser(userId, {
+        is_throttled: false,
+        throttled_until: null
+      });
+      return false;
     }
   }
   
-  await sendAndAutoDelete(chatId, text, 30000, { parse_mode: 'HTML' });
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+  return false;
+}
 
-// /unthrottle - Remove throttle
-bot.onText(/\/unthrottle\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/* ----------------------- Engagement Tier Classification ----------------------- */
+/**
+ * Calculate and update engagement tier for a user
+ */
+async function updateEngagementTier(userId) {
+  const user = await getUser(userId);
+  if (!user) return null;
   
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+  const now = Date.now();
+  const daysSinceRegistration = (now - user.registered_at) / (1000 * 60 * 60 * 24);
+  const hoursSinceLastSeen = (now - user.last_seen) / (1000 * 60 * 60);
+  
+  // Get activity stats
+  const activityStats = await getUserActivityStats(userId, 7 * 24 * 60 * 60 * 1000); // Last 7 days
+  const totalActivities = activityStats.reduce((sum, stat) => sum + parseInt(stat.count), 0);
+  
+  // Get referral quality
+  const refAnalysis = await analyzeReferralPattern(userId);
+  const referralQuality = parseFloat(refAnalysis.percentage) || 0;
+  
+  // Get completed tasks
+  const completedTasks = await getUserCompletedTasks(userId);
+  const taskCount = completedTasks.length;
+  
+  // Calculate tier score (0-100)
+  let tierScore = 0;
+  
+  // Activity frequency (0-30 points)
+  const activitiesPerDay = totalActivities / 7;
+  tierScore += Math.min(30, activitiesPerDay * 3);
+  
+  // Streak bonus (0-15 points)
+  tierScore += Math.min(15, (user.current_streak || 0) * 1.5);
+  
+  // Task completion (0-20 points)
+  tierScore += Math.min(20, taskCount * 4);
+  
+  // Referral quality (0-15 points)
+  tierScore += (referralQuality / 100) * 15;
+  
+  // Verification bonus (10 points)
+  if (user.verified) tierScore += 10;
+  
+  // Account age bonus (0-10 points)
+  tierScore += Math.min(10, daysSinceRegistration * 0.5);
+  
+  // Penalty for inactivity
+  if (hoursSinceLastSeen > 168) { // 7 days
+    tierScore *= 0.5;
+  } else if (hoursSinceLastSeen > 72) { // 3 days
+    tierScore *= 0.7;
   }
   
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
+  // Determine tier
+  let tier;
+  if (tierScore >= 70) {
+    tier = 'Elite';
+  } else if (tierScore >= 50) {
+    tier = 'Active';
+  } else if (tierScore >= 30) {
+    tier = 'Regular';
+  } else if (tierScore >= 15) {
+    tier = 'Dormant';
+  } else {
+    tier = 'Ghost';
   }
   
-  await db.updateUser(targetId, {
-    is_throttled: false,
-    throttled_until: null,
-    spam_score: 0
+  // Update user tier
+  await updateUser(userId, {
+    engagement_tier: tier,
+    tier_updated_at: now
   });
   
-  const userIdentifier = await getUserIdentifier(targetId);
-  await sendAndAutoDelete(chatId, `✅ Throttle removed for ${userIdentifier}`, 30000);
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+  return { tier, tierScore };
+}
 
-// /detectbot - Run bot detection
-bot.onText(/\/detectbot\s+(@?\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/**
+ * Get users by engagement tier
+ */
+async function getUsersByTier(tier) {
+  const result = await pool.query(
+    'SELECT * FROM users WHERE engagement_tier = $1 ORDER BY activity_score DESC',
+    [tier]
+  );
+  return result.rows;
+}
+
+/**
+ * Get tier distribution statistics
+ */
+async function getTierDistribution() {
+  const result = await pool.query(
+    `SELECT engagement_tier, COUNT(*) as count
+     FROM users
+     GROUP BY engagement_tier
+     ORDER BY 
+       CASE engagement_tier
+         WHEN 'Elite' THEN 1
+         WHEN 'Active' THEN 2
+         WHEN 'Regular' THEN 3
+         WHEN 'Dormant' THEN 4
+         WHEN 'Ghost' THEN 5
+       END`
+  );
+  return result.rows;
+}
+
+/* ----------------------- Decay Systems ----------------------- */
+/**
+ * Apply idle decay to inactive users
+ */
+async function applyIdleDecay() {
+  const now = Date.now();
+  const threeDaysAgo = now - (3 * 24 * 60 * 60 * 1000);
+  const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
   
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
+  // Get inactive users
+  const result = await pool.query(
+    `SELECT id, activity_score, last_seen FROM users 
+     WHERE last_seen < $1 AND (last_decay_applied IS NULL OR last_decay_applied < $2)`,
+    [threeDaysAgo, now - (24 * 60 * 60 * 1000)]
+  );
+  
+  const users = result.rows;
+  let decayedCount = 0;
+  
+  for (const user of users) {
+    const daysSinceLastSeen = (now - user.last_seen) / (1000 * 60 * 60 * 24);
+    let decayFactor = 1;
+    
+    if (daysSinceLastSeen >= 7) {
+      decayFactor = 0.9; // 10% decay per day after 7 days
+    } else if (daysSinceLastSeen >= 3) {
+      decayFactor = 0.95; // 5% decay per day after 3 days
+    }
+    
+    const newScore = parseFloat(user.activity_score || 0) * decayFactor;
+    
+    await updateUser(user.id, {
+      activity_score: newScore,
+      last_decay_applied: now
+    });
+    
+    decayedCount++;
   }
   
-  const input = match[1].trim();
-  const targetId = await resolveUserInput(input);
-  
-  if (!targetId) {
-    await sendAndAutoDelete(chatId, "❌ User not found.", 30000);
-    deleteMessageLater(chatId, msg.message_id, 30000);
-    return;
-  }
-  
-  const detection = await db.detectBotOrFakeUser(targetId);
-  const userIdentifier = await getUserIdentifier(targetId);
-  
-  let text = `🤖 <b>Bot Detection for ${userIdentifier}</b>\n\n`;
-  text += `Classification: ${detection.classification}\n`;
-  text += `Is Bot: ${detection.isBot ? '⚠️ Yes' : '✅ No'}\n`;
-  text += `Is Fake: ${detection.isFake ? '🚫 Yes' : '✅ No'}\n`;
-  text += `Bot Score: ${detection.botScore}/100\n`;
-  text += `Fake Score: ${detection.fakeScore}/100\n`;
-  text += `Confidence: ${detection.confidence}%\n\n`;
-  text += `<b>Reasons:</b>\n`;
-  detection.reasons.forEach((reason, i) => {
-    text += `${i + 1}. ${reason}\n`;
-  });
-  
-  await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
+  return { decayedCount, totalChecked: users.length };
+}
 
-// /maintenance - Run all maintenance tasks
-bot.onText(/\/maintenance/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
+/**
+ * Apply referral decay to reduce influence of inactive/fake referrals
+ */
+async function applyReferralDecay() {
+  const allUsers = await getAllUsers();
+  let processedCount = 0;
   
-  if (!isAdminId(adminId)) {
-    await sendEphemeralWarning(chatId, "⛔ Admin only!");
-    return;
-  }
-  
-  await sendAndAutoDelete(chatId, '🔄 Running maintenance tasks...', 5000);
-  
-  try {
-    const result = await db.runMaintenanceTasks();
+  for (const user of allUsers) {
+    const referrals = await getUserReferrals(user.id);
+    if (referrals.length === 0) continue;
     
-    let text = `✅ <b>Maintenance Complete</b>\n\n`;
-    text += `Idle Decay: ${result.idleDecay.decayedCount} users\n`;
-    text += `Referral Decay: ${result.referralDecay.processedCount} users\n`;
-    text += `Tiers Updated: ${result.tiersUpdated} users\n`;
+    let activeReferrals = 0;
+    const now = Date.now();
+    const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
     
-    await sendAndAutoDelete(chatId, text, 60000, { parse_mode: 'HTML' });
-  } catch (error) {
-    await sendAndAutoDelete(chatId, `❌ Maintenance failed: ${error.message}`, 30000);
-  }
-  
-  deleteMessageLater(chatId, msg.message_id, 30000);
-});
-
-/* ==================== GROUP MEMBER TRACKING ==================== */
-
-// Track new members joining
-bot.on('new_chat_members', async (msg) => {
-  const chatId = msg.chat.id;
-  
-  // Only track in admin group
-  if (chatId !== ADMIN_GROUP_ID) return;
-  
-  for (const member of msg.new_chat_members) {
-    if (member.is_bot) continue;
-    
-    const userId = member.id;
-    const username = member.username || '';
-    
-    try {
-      await db.ensureUser(userId, username);
-      await db.logActivity(userId, 'joined_group', { chatId, username }, chatId, 'group');
+    for (const refId of referrals) {
+      const refUser = await getUser(refId);
+      if (!refUser) continue;
       
-      // Auto-flag if no username
-      if (!username) {
-        await db.flagUserAsFake(userId, 'No username - joined group');
-      }
+      // Check if referral is active
+      const isActive = refUser.last_seen > sevenDaysAgo && 
+                      (refUser.message_count || 0) > 5 &&
+                      refUser.verified;
+      
+      if (isActive) activeReferrals++;
+    }
+    
+    // Calculate referral quality score
+    const qualityRatio = referrals.length > 0 ? activeReferrals / referrals.length : 0;
+    
+    // This score can be used in tier calculations
+    // Store it in activity_data for now
+    await logActivity(user.id, 'referral_quality_check', {
+      totalReferrals: referrals.length,
+      activeReferrals,
+      qualityRatio
+    });
+    
+    processedCount++;
+  }
+  
+  return { processedCount };
+}
+
+/**
+ * Run all decay and maintenance tasks
+ */
+async function runMaintenanceTasks() {
+  console.log('🔄 Running maintenance tasks...');
+  
+  const idleDecayResult = await applyIdleDecay();
+  console.log(`✅ Idle decay applied to ${idleDecayResult.decayedCount} users`);
+  
+  const referralDecayResult = await applyReferralDecay();
+  console.log(`✅ Referral decay processed for ${referralDecayResult.processedCount} users`);
+  
+  // Update engagement tiers for all users
+  const allUsers = await getAllUsers();
+  let tiersUpdated = 0;
+  
+  for (const user of allUsers) {
+    try {
+      await updateEngagementTier(user.id);
+      tiersUpdated++;
     } catch (error) {
-      console.error('Error tracking new member:', error);
+      console.error(`Error updating tier for user ${user.id}:`, error);
     }
   }
-});
+  
+  console.log(`✅ Engagement tiers updated for ${tiersUpdated} users`);
+  
+  return {
+    idleDecay: idleDecayResult,
+    referralDecay: referralDecayResult,
+    tiersUpdated
+  };
+}
 
-// Track members leaving
-bot.on('left_chat_member', async (msg) => {
-  const chatId = msg.chat.id;
+/* ----------------------- Enhanced Bot Detection ----------------------- */
+/**
+ * Comprehensive bot/fake user detection
+ */
+async function detectBotOrFakeUser(userId) {
+  const user = await getUser(userId);
+  if (!user) return { isFake: true, isBot: true, confidence: 100, reasons: ['User not found'] };
   
-  // Only track in admin group
-  if (chatId !== ADMIN_GROUP_ID) return;
+  const now = Date.now();
+  const hoursSinceRegistration = (now - user.registered_at) / (1000 * 60 * 60);
+  const daysSinceRegistration = hoursSinceRegistration / 24;
   
-  const member = msg.left_chat_member;
-  if (member.is_bot) return;
+  const reasons = [];
+  let botScore = 0;
+  let fakeScore = 0;
   
-  const userId = member.id;
-  
-  try {
-    // Ensure user exists before logging
-    await db.ensureUser(userId, member.username || '');
-    await db.logActivity(userId, 'left_group', { chatId }, chatId, 'group');
-    
-    // Auto-flag as fake for joining and leaving
-    await db.flagUserAsFake(userId, 'Joined and left group');
-  } catch (error) {
-    console.error('Error tracking member leaving:', error);
+  // Check 1: No activity at all
+  if ((user.message_count || 0) === 0 && hoursSinceRegistration > 24) {
+    fakeScore += 30;
+    reasons.push('No messages after 24h');
   }
-});
+  
+  // Check 2: No username - AUTOMATICALLY FLAG AS FAKE
+  if (!user.username || user.username.length === 0) {
+    fakeScore += 40; // Increased from 15 to 40
+    reasons.push('No username - automatically flagged as fake');
+  }
+  
+  // Check 3: Very low activity score
+  if ((user.activity_score || 0) < 0.01 && daysSinceRegistration > 1) {
+    fakeScore += 20;
+    reasons.push('Extremely low activity score');
+  }
+  
+  // Check 4: Never verified
+  if (!user.verified && daysSinceRegistration > 7) {
+    botScore += 10;
+    reasons.push('Not verified after 7 days');
+  }
+  
+  // Check 5: No wallet set
+  if (!user.wallet && daysSinceRegistration > 3) {
+    botScore += 10;
+    reasons.push('No wallet after 3 days');
+  }
+  
+  // Check 6: Check activity patterns
+  const activityStats = await getUserActivityStats(userId, 7 * 24 * 60 * 60 * 1000);
+  const totalActivities = activityStats.reduce((sum, stat) => sum + parseInt(stat.count), 0);
+  
+  if (totalActivities === 0 && daysSinceRegistration > 1) {
+    fakeScore += 25;
+    reasons.push('No activity in last 7 days');
+  }
+  
+  // Check 7: Suspicious activity pattern (all same type)
+  if (activityStats.length === 1 && totalActivities > 20) {
+    botScore += 15;
+    reasons.push('Repetitive activity pattern');
+  }
+  
+  // Check 8: No completed tasks
+  const completedTasks = await getUserCompletedTasks(userId);
+  if (completedTasks.length === 0 && daysSinceRegistration > 7) {
+    botScore += 10;
+    reasons.push('No completed tasks');
+  }
+  
+  // Check 9: High spam score
+  if ((user.spam_score || 0) > 20) {
+    botScore += 20;
+    reasons.push('High spam score');
+  }
+  
+  // Check 10: Referral pattern analysis
+  const refAnalysis = await analyzeReferralPattern(userId);
+  if (parseFloat(refAnalysis.percentage) < 20 && (refAnalysis.realRefs + refAnalysis.suspiciousRefs) > 5) {
+    botScore += 15;
+    reasons.push('Poor referral quality');
+  }
+  
+  const totalScore = Math.max(botScore, fakeScore);
+  const isBot = botScore > 50;
+  const isFake = fakeScore > 50;
+  const confidence = Math.min(100, totalScore);
+  
+  return {
+    isBot,
+    isFake,
+    botScore,
+    fakeScore,
+    confidence,
+    reasons,
+    classification: isFake ? 'Fake' : isBot ? 'Bot' : confidence > 30 ? 'Suspicious' : 'Real'
+  };
+}
 
-/* Final: Keep console log so you know the bot started */
-console.log("Bot webhook server is running and handlers are registered.");
-console.log("✅ Activity tracking enabled");
-console.log("✅ Auto-maintenance scheduled (every 6 hours)");
-console.log("✅ Auto-tracking updates scheduled (every 10 minutes)");
-console.log("✅ Group member tracking enabled");
+/* ----------------------- Verification advancement helper ----------------------- */
+async function verifyUserAndReward(refereeId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock referee
+    const refRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [refereeId]);
+    const referee = refRes.rows[0];
+    if (!referee) throw new Error('Referee not found');
+
+    if (referee.verified) {
+      await client.query('COMMIT');
+      return { alreadyVerified: true };
+    }
+
+    // Mark referee verified
+    await client.query('UPDATE users SET verified = TRUE WHERE id = $1', [refereeId]);
+
+    // If referred_by exists, reward the referrer
+    if (referee.referred_by) {
+      const referrerId = referee.referred_by;
+      const rRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [referrerId]);
+      const referrer = rRes.rows[0];
+
+      if (referrer) {
+        const referralReward = parseFloat((await getSetting('referralReward')) || '0');
+        const newBalance = (parseFloat(referrer.balance) || 0) + referralReward;
+        await client.query('UPDATE users SET balance = $1 WHERE id = $2', [newBalance, referrerId]);
+
+        // Add referral record (idempotent)
+        await client.query('INSERT INTO referrals (referrer_id, referred_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [referrerId, refereeId]);
+
+        // increment referralReward counter? (We keep counters separate)
+      }
+    }
+
+    await client.query('COMMIT');
+    return { success: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get referrer information for a user
+ */
+async function getReferrerInfo(userId) {
+  const user = await getUser(userId);
+  if (!user || !user.referred_by) return null;
+  
+  const referrer = await getUser(user.referred_by);
+  if (!referrer) return null;
+  
+  return {
+    id: referrer.id,
+    username: referrer.username,
+    verified: referrer.verified,
+    registeredAt: referrer.registered_at
+  };
+}
+
+/**
+ * Rebuild activity history from registration to present
+ */
+async function rebuildUserActivityHistory(userId) {
+  const user = await getUser(userId);
+  if (!user) return { success: false, message: 'User not found' };
+  
+  const registrationDate = new Date(user.registered_at);
+  const today = new Date();
+  const daysSinceRegistration = Math.floor((today - registrationDate) / (1000 * 60 * 60 * 24));
+  
+  // Get all activity logs for this user
+  const activityLogs = await getUserActivityLogs(userId, { limit: 10000 });
+  
+  // Rebuild streak based on activity logs
+  const activityDates = new Set();
+  activityLogs.forEach(log => {
+    const logDate = new Date(log.timestamp).toISOString().split('T')[0];
+    activityDates.add(logDate);
+  });
+  
+  // Calculate current streak
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let tempStreak = 0;
+  
+  const sortedDates = Array.from(activityDates).sort().reverse();
+  const todayStr = today.toISOString().split('T')[0];
+  
+  for (let i = 0; i < sortedDates.length; i++) {
+    const currentDate = new Date(sortedDates[i]);
+    const nextDate = sortedDates[i + 1] ? new Date(sortedDates[i + 1]) : null;
+    
+    tempStreak++;
+    
+    if (nextDate) {
+      const dayDiff = Math.floor((currentDate - nextDate) / (1000 * 60 * 60 * 24));
+      if (dayDiff !== 1) {
+        longestStreak = Math.max(longestStreak, tempStreak);
+        if (i === 0) currentStreak = tempStreak;
+        tempStreak = 0;
+      }
+    } else {
+      longestStreak = Math.max(longestStreak, tempStreak);
+      if (i === 0) currentStreak = tempStreak;
+    }
+  }
+  
+  // Update user with rebuilt data
+  await updateUser(userId, {
+    current_streak: currentStreak,
+    longest_streak: longestStreak
+  });
+  
+  return {
+    success: true,
+    currentStreak,
+    longestStreak,
+    totalActivityDays: activityDates.size,
+    daysSinceRegistration
+  };
+}
+
+/**
+ * Update submission status (for atomic operations)
+ */
+async function updateSubmissionStatus(submissionId, status, reviewedBy) {
+  await pool.query(
+    'UPDATE task_submissions SET status = $1, reviewed_at = $2, reviewed_by = $3 WHERE id = $4',
+    [status, Date.now(), reviewedBy, submissionId]
+  );
+}
+
+/**
+ * Flag user as fake (for join/leave tracking)
+ */
+async function flagUserAsFake(userId, reason = 'Joined and left group') {
+  try {
+    await logActivity(userId, 'flagged_as_fake', { reason }, null, null);
+    
+    // Update user to mark as suspicious
+    await updateUser(userId, {
+      spam_score: Math.min(100, (await getUser(userId))?.spam_score || 0 + 50)
+    });
+  } catch (error) {
+    console.error('Error flagging user as fake:', error);
+  }
+}
+
+module.exports = {
+  initializeDatabase,
+  getUser,
+  createUser,
+  updateUser,
+  ensureUser,
+  addReferral,
+  getUserReferrals,
+  getReferralCount,
+  getReferrerInfo,
+  createTask,
+  getTasks,
+  getTaskById,
+  deleteTask,
+  getUserCompletedTasks,
+  markTaskCompleted,
+  createTaskSubmission,
+  getSubmissionById,
+  getLatestPendingSubmission,
+  approveSubmissionAtomic,
+  rejectSubmissionAtomic,
+  updateSubmissionStatus,
+  getPendingSubmissions: async () => {
+    const r = await pool.query("SELECT * FROM task_submissions WHERE status = 'pending' ORDER BY submitted_at ASC");
+    return r.rows;
+  },
+  approveAllPendingSubmissions,
+  rejectAllPendingSubmissions,
+  getSetting,
+  setSetting,
+  incrementSetting,
+  getAllUsers,
+  getVerifiedUsers,
+  getTotalBalance,
+  createWithdrawalRequest,
+  getLatestPendingWithdrawal,
+  updateWithdrawalStatus,
+  getUserWithdrawalStats,
+  blacklistUser,
+  unblacklistUser,
+  isUserBlacklisted,
+  getAllBlacklistedUsers,
+  analyzeReferralPattern,
+  getDetailedReferralAnalysis,
+  verifyUserAndReward,
+  flagUserAsFake,
+  rebuildUserActivityHistory,
+  // Activity tracking
+  logActivity,
+  getUserActivityLogs,
+  getUserActivityStats,
+  // Spam detection
+  checkSpamBehavior,
+  isUserThrottled,
+  // Engagement tiers
+  updateEngagementTier,
+  getUsersByTier,
+  getTierDistribution,
+  // Decay systems
+  applyIdleDecay,
+  applyReferralDecay,
+  runMaintenanceTasks,
+  // Bot detection
+  detectBotOrFakeUser,
+  pool
+};
