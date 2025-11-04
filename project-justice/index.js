@@ -1511,40 +1511,64 @@ bot.onText(/\/userinfo\s+(.+)/, async (msg, match) => {
   const referralReward = parseFloat(await db.getSetting('referralReward')) || 20;
   const totalReferralEarnings = refAnalysis.realRefs * referralReward;
 
-  let info = `👤 <b>User Information</b>\n\n`;
-  info += `<b>━━━━━ Basic Info ━━━━━</b>\n`;
-  info += `├ ID: <code>${user.id}</code>\n`;
-  info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
-  info += `├ Balance: <b>${user.balance} ${CURRENCY_SYMBOL}</b>\n`;
-  info += `├ Wallet: <code>${user.wallet || '(not set)'}</code>\n`;
-  info += `├ Verified: ${user.verified ? '✅ Yes' : '❌ No'}\n`;
-  info += `└ Registered: ${new Date(user.registered_at).toLocaleString()}\n\n`;
-  
-  info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
-  info += `├ Messages Sent: ${user.message_count || 0}\n`;
-  const activityScore = parseFloat(user.activity_score);
-  info += `├ Activity Score: ${!isNaN(activityScore) ? activityScore.toFixed(2) : 0}\n`;
-  info += `├ Completed Tasks: ${completedTasks.length}\n`;
+ let info = `👤 <b>User Information</b>\n\n`;
+
+// ━━━━━ BASIC INFO ━━━━━
+info += `<b>━━━━━ Basic Info ━━━━━</b>\n`;
+info += `├ ID: <code>${user.id}</code>\n`;
+info += `├ Username: ${user.username ? '@' + user.username : '(none)'}\n`;
+
+const balance = parseFloat(user.balance) || 0;
+info += `├ Balance: <b>${balance.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
+
+info += `├ Wallet: <code>${user.wallet || '(not set)'}</code>\n`;
+info += `├ Verified: ${user.verified ? '✅ Yes' : '❌ No'}\n`;
+info += `└ Registered: ${
+  user.registered_at ? new Date(user.registered_at).toLocaleString() : 'N/A'
+}\n\n`;
+
+// ━━━━━ ACTIVITY STATS ━━━━━
+info += `<b>━━━━━ Activity Stats ━━━━━</b>\n`;
+info += `├ Messages Sent: ${user.message_count || 0}\n`;
+
+const activityScore = parseFloat(user.activity_score);
+info += `├ Activity Score: ${
+  !isNaN(activityScore) ? activityScore.toFixed(2) : '0.00'
+}\n`;
+
+info += `├ Completed Tasks: ${completedTasks?.length || 0}\n`;
+
+let lastSeenStr = 'N/A';
+if (user.last_seen) {
   const timeSinceLastSeen = Date.now() - user.last_seen;
   const hoursSinceLastSeen = timeSinceLastSeen / (1000 * 60 * 60);
-  const lastSeenStr = hoursSinceLastSeen < 1 ? `${Math.floor(hoursSinceLastSeen * 60)}m ago` : 
-                      hoursSinceLastSeen < 24 ? `${Math.floor(hoursSinceLastSeen)}h ago` : 
-                      `${Math.floor(hoursSinceLastSeen / 24)}d ago`;
-  info += `└ Last Seen: ${lastSeenStr}\n\n`;
-  
-  info += `<b>━━━━━ Withdrawal Stats ━━━━━</b>\n`;
-  info += `├ Total Withdrawn: <b>${withdrawalStats.totalWithdrawn} ${CURRENCY_SYMBOL}</b>\n`;
-  info += `├ Approved: ${withdrawalStats.approvedCount}\n`;
-  info += `├ Pending: ${withdrawalStats.pendingCount}\n`;
-  info += `└ Rejected: ${withdrawalStats.rejectedCount}\n\n`;
-  
-  info += `<b>━━━━━ Referral Analysis ━━━━━</b>\n`;
-  info += `├ Total Referrals: ${refCount}\n`;
-  info += `├ Real Users: ${refAnalysis.realRefs} ✅\n`;
-  info += `├ Suspicious: ${refAnalysis.suspiciousRefs} ⚠️\n`;
-  info += `├ Quality Score: ${refAnalysis.score}\n`;
-  info += `├ Quality: ${refAnalysis.percentage}%\n`;
-  info += `└ Referral Earnings: <b>${totalReferralEarnings} ${CURRENCY_SYMBOL}</b>\n\n`;
+  lastSeenStr =
+    hoursSinceLastSeen < 1
+      ? `${Math.floor(hoursSinceLastSeen * 60)}m ago`
+      : hoursSinceLastSeen < 24
+      ? `${Math.floor(hoursSinceLastSeen)}h ago`
+      : `${Math.floor(hoursSinceLastSeen / 24)}d ago`;
+}
+info += `└ Last Seen: ${lastSeenStr}\n\n`;
+
+// ━━━━━ WITHDRAWAL STATS ━━━━━
+info += `<b>━━━━━ Withdrawal Stats ━━━━━</b>\n`;
+const totalWithdrawn = parseFloat(withdrawalStats.totalWithdrawn) || 0;
+info += `├ Total Withdrawn: <b>${totalWithdrawn.toFixed(2)} ${CURRENCY_SYMBOL}</b>\n`;
+info += `├ Approved: ${withdrawalStats.approvedCount || 0}\n`;
+info += `├ Pending: ${withdrawalStats.pendingCount || 0}\n`;
+info += `└ Rejected: ${withdrawalStats.rejectedCount || 0}\n\n`;
+
+// ━━━━━ REFERRAL ANALYSIS ━━━━━
+info += `<b>━━━━━ Referral Analysis ━━━━━</b>\n`;
+info += `├ Total Referrals: ${refCount || 0}\n`;
+info += `├ Real Users: ${refAnalysis?.realRefs || 0} ✅\n`;
+info += `├ Suspicious: ${refAnalysis?.suspiciousRefs || 0} ⚠️\n`;
+info += `├ Quality Score: ${
+  parseFloat(refAnalysis?.score) || 0
+}\n`;
+info += `├ Quality: ${parseFloat(refAnalysis?.percentage) || 0}%\n`;
+info += `└ Referral Earnings: <b>${parseFloat(totalReferralEarnings) || 0} ${CURRENCY_SYMBOL}</b>\n\n`;
 
   if (referralDetails.length > 0) {
     info += `<b>━━━━━ 📋 Detailed Referral List ━━━━━</b>\n\n`;
