@@ -37,6 +37,23 @@ if (!token) {
 // Create bot WITHOUT polling — we'll use webhook
 const bot = new TelegramBot(token);
 
+// Add global error handlers to prevent crashes
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit the process, just log the error
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit the process for network errors
+  if (error.code === 'EFATAL' || error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
+    console.log('Network error detected, continuing...');
+    return;
+  }
+  // For other critical errors, you might want to restart
+  console.error('Critical error, but continuing...');
+});
+
 // Webhook configuration
 const HOST = process.env.HOST; // e.g. https://yourdomain.com (MUST be HTTPS)
 const WEBHOOK_PATH = `/bot${token}`; // route to receive updates
@@ -1122,12 +1139,32 @@ async function handleStats(chatId) {
     score: healthScore
   };
 
+  // Enhanced fake user detection
+  let fakeUsers = 0;
+  let botUsers = 0;
+  
+  for (const user of allUsers) {
+    const detection = await db.detectBotOrFakeUser(user.id);
+    if (detection.isFake) {
+      fakeUsers++;
+    }
+    if (detection.isBot) {
+      botUsers++;
+    }
+  }
+  
+  // Get pending submissions count
+  const pendingSubmissions = await db.getPendingSubmissionsCount();
+  
   let statsText = `📊 System Statistics\n\n` +
     `Total Users: ${totalUsers}\n` +
     `Real Users: ${systemHealth.realUsers}\n` +
     `Suspicious Users: ${systemHealth.suspiciousUsers}\n` +
+    `🤖 Bot Users: ${botUsers}\n` +
+    `🚫 Fake Users: ${fakeUsers}\n` +
     `Users Online: ${onlineUsers}\n` +
     `Users Offline: ${offlineUsers}\n` +
+    `📋 Pending Tasks: ${pendingSubmissions}\n` +
     `Total Balance: ${totalBalance} ${CURRENCY_SYMBOL}\n\n` +
     `Progress Score: ${systemHealth.score}`;
   
@@ -1271,8 +1308,13 @@ async function handleAdminTaskConfirm(adminId, targetId, submissionId, chatId, m
 
   const submission = await db.getSubmissionById(submissionId);
   
-  if (!submission || submission.status !== 'pending') {
-    await sendAutoDeleteMessage(chatId, "❌ Submission not found or already processed.");
+  if (!submission) {
+    await sendAutoDeleteMessage(chatId, "❌ Submission not found.");
+    return;
+  }
+  
+  if (submission.status !== 'pending') {
+    await sendAutoDeleteMessage(chatId, `ℹ️ This submission was already ${submission.status}.`);
     return;
   }
 
@@ -1287,7 +1329,9 @@ async function handleAdminTaskConfirm(adminId, targetId, submissionId, chatId, m
 
   try {
     await bot.sendMessage(actualUserId, `✅ Your task has been approved!\nReward: ${reward} ${CURRENCY_SYMBOL}\nNew balance: ${newBalance} ${CURRENCY_SYMBOL}`);
-  } catch (e) {}
+  } catch (e) {
+    console.error('Error notifying user:', e.message);
+  }
 
   const userIdentifier = await getUserIdentifier(actualUserId);
   const approvalText = `✅ Task approved for ${userIdentifier}. Reward: ${reward} ${CURRENCY_SYMBOL}`;
@@ -1322,8 +1366,13 @@ async function handleAdminTaskReject(adminId, targetId, submissionId, chatId, me
 
   const submission = await db.getSubmissionById(submissionId);
   
-  if (!submission || submission.status !== 'pending') {
-    await sendAutoDeleteMessage(chatId, "❌ Submission not found or already processed.");
+  if (!submission) {
+    await sendAutoDeleteMessage(chatId, "❌ Submission not found.");
+    return;
+  }
+  
+  if (submission.status !== 'pending') {
+    await sendAutoDeleteMessage(chatId, `ℹ️ This submission was already ${submission.status}.`);
     return;
   }
 
@@ -1333,7 +1382,9 @@ async function handleAdminTaskReject(adminId, targetId, submissionId, chatId, me
 
   try {
     await bot.sendMessage(actualUserId, `❌ Your task submission was rejected. Please try again with better proof.`);
-  } catch (e) {}
+  } catch (e) {
+    console.error('Error notifying user:', e.message);
+  }
 
   const userIdentifier = await getUserIdentifier(actualUserId);
   const rejectionText = `❌ Task rejected for ${userIdentifier}.`;
@@ -2392,4 +2443,4 @@ console.log("Bot webhook server is running and handlers are registered.");
 console.log("✅ Activity tracking enabled");
 console.log("✅ Auto-maintenance scheduled (every 6 hours)");
 console.log("✅ Auto-tracking updates scheduled (every 10 minutes)");
-console.log("✅ Group member tracking enabled");
+console.log("✅ Group member tracking enabled");v
